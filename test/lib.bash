@@ -10,6 +10,7 @@ export TEST_NAMESPACE="${TEST_NAMESPACE:-serverless-tests}"
 NAMESPACES+=("${TEST_NAMESPACE}")
 NAMESPACES+=("serverless-tests2")
 NAMESPACES+=("serverless-tests3")
+NAMESPACES+=("serverless-tests-mesh")
 
 source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/serving.bash"
 source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/eventing.bash"

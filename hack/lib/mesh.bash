@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
   
 istio_deployments="istio-citadel istio-galley istio-pilot istio-sidecar-injector kiali"
-mesh_deployments="elasticsearch-operator istio-operator jaeger-operator kiali-operator"
+mesh_deployments="istio-operator jaeger-operator kiali-operator"
 
 function install_mesh {
   deploy_servicemesh_operators
-  deploy_servicemesh_namespace
-  deploy_servicemesh_example_certificates
-  deploy_smcp
-  add_smmr
+  #deploy_servicemesh_namespace
+  #deploy_servicemesh_example_certificates
+  #deploy_smcp
+  #add_smmr
 }
 
 function uninstall_mesh {
-  remove_smmr
+  #remove_smmr
 
-  undeploy_smcp
-  undeploy_servicemesh_example_certificates
-  undeploy_servicemesh_namespace
+  #undeploy_smcp
+  #undeploy_servicemesh_example_certificates
+  #undeploy_servicemesh_namespace
   undeploy_servicemesh_operators
 }
 
@@ -26,18 +26,6 @@ function deploy_servicemesh_operators {
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
-  name: elasticsearch-operator
-  namespace: openshift-operators
-spec:
-  channel: preview
-  name: elasticsearch-operator
-  installPlanApproval: Automatic
-  source: redhat-operators
-  sourceNamespace: openshift-marketplace
----
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
   name: jaeger-product
   namespace: openshift-operators
 spec:
@@ -65,7 +53,7 @@ metadata:
   name: servicemeshoperator
   namespace: openshift-operators
 spec:
-  channel: "1.0"
+  channel: stable
   name: servicemeshoperator
   installPlanApproval: Automatic
   source: redhat-operators
@@ -73,7 +61,7 @@ spec:
 EOF
 
   logger.info "Waiting until service mesh operators are available"
-  timeout 600 "[[ \$(oc get deploy -n openshift-operators ${mesh_deployments} --no-headers | wc -l) != 4 ]]" || return 1
+  timeout 600 "[[ \$(oc get deploy -n openshift-operators ${mesh_deployments} --no-headers | wc -l) != 3 ]]" || return 1
   oc wait --for=condition=Available deployment ${mesh_deployments} --timeout=300s -n openshift-operators || return $?
 }
 
@@ -206,7 +194,7 @@ function undeploy_smcp {
 
 function undeploy_servicemesh_operators {
   logger.info "Deleting subscriptions"
-  oc delete subscriptions.operators.coreos.com -n openshift-operators servicemeshoperator kiali-ossm jaeger-product elasticsearch-operator --ignore-not-found
+  oc delete subscriptions.operators.coreos.com -n openshift-operators servicemeshoperator kiali-ossm jaeger-product --ignore-not-found
 }
 
 function undeploy_servicemesh_example_certificates {
