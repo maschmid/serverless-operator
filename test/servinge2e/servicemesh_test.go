@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -22,7 +23,6 @@ import (
 	"github.com/openshift-knative/serverless-operator/test"
 	routev1 "github.com/openshift/api/route/v1"
 	core "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -44,15 +44,14 @@ type testCase struct {
 }
 
 const (
-	// A test namespace that is part of the ServiceMesh (setup by "make install-mesh")
-	serviceMeshTestNamespaceName = "default"
+	serviceMeshTestNamespaceName = "serverless-tests-mesh"
 	helloworldImage              = "gcr.io/knative-samples/helloworld-go"
 	httpProxyImage               = "registry.svc.ci.openshift.org/openshift/knative-v0.17.3:knative-serving-test-httpproxy"
 	istioInjectKey               = "sidecar.istio.io/inject"
 )
 
 func getServiceMeshNamespace(ctx *test.Context) string {
-	namespace, err := ctx.Clients.Kube.CoreV1().Namespaces().Get(context.Background(), serviceMeshTestNamespaceName, meta.GetOptions{})
+	namespace, err := ctx.Clients.Kube.CoreV1().Namespaces().Get(context.Background(), testNamespace, meta.GetOptions{})
 	if err != nil {
 		ctx.T.Fatalf("Failed to verify %q namespace labels: %v", serviceMeshTestNamespaceName, err)
 	}
@@ -303,7 +302,7 @@ func TestKsvcWithServiceMeshJWTDefaultPolicy(t *testing.T) {
 	// istio-pilot caches the JWKS content if a new Policy has the same jwksUri as some old policy.
 	// Rerunning this test would fail if we kept the jwksUri constant across invocations then,
 	// hence the random suffix for the jwks ksvc.
-	jwksKsvc := test.Service(helpers.AppendRandomString("jwks"), serviceMeshTestNamespaceName, "openshift/hello-openshift", nil)
+	jwksKsvc := test.Service(helpers.AppendRandomString("jwks"), testNamespace, "openshift/hello-openshift", nil)
 	jwksKsvc.Spec.Template.Spec.Containers[0].Env = append(jwksKsvc.Spec.Template.Spec.Containers[0].Env, core.EnvVar{
 		Name:  "RESPONSE",
 		Value: jwks,
@@ -353,7 +352,7 @@ func TestKsvcWithServiceMeshJWTDefaultPolicy(t *testing.T) {
 		Resource: "policies",
 	}
 
-	authPolicy, err = caCtx.Clients.Dynamic.Resource(policyGvr).Namespace(serviceMeshTestNamespaceName).Create(context.Background(), authPolicy, meta.CreateOptions{})
+	authPolicy, err = caCtx.Clients.Dynamic.Resource(policyGvr).Namespace(testNamespace).Create(context.Background(), authPolicy, meta.CreateOptions{})
 	if err != nil {
 		t.Fatalf("Error creating istio Policy: %v", err)
 	}
@@ -364,7 +363,7 @@ func TestKsvcWithServiceMeshJWTDefaultPolicy(t *testing.T) {
 	})
 
 	// Create a test ksvc, should be accessible only via proper JWT token
-	testKsvc := test.Service("jwt-test", serviceMeshTestNamespaceName, image, map[string]string{
+	testKsvc := test.Service("jwt-test", testNamespace, image, map[string]string{
 		"sidecar.istio.io/inject": "true",
 	})
 	testKsvc = withServiceReadyOrFail(caCtx, testKsvc)
@@ -513,7 +512,7 @@ func TestKsvcWithServiceMeshJWTDefaultPolicy(t *testing.T) {
 
 func lookupOpenShiftRouterIP(ctx *test.Context) net.IP {
 	// Deploy an auxiliary ksvc accessible via an OpenShift route, so that we have a route hostname that we can resolve
-	aux := test.Service("aux", serviceMeshTestNamespaceName, "openshift/hello-openshift", nil)
+	aux := test.Service("aux", testNamespace, "openshift/hello-openshift", nil)
 	aux = withServiceReadyOrFail(ctx, aux)
 
 	ips, err := net.LookupIP(aux.Status.URL.Host)
@@ -527,6 +526,7 @@ func lookupOpenShiftRouterIP(ctx *test.Context) net.IP {
 	ctx.T.Logf("Resolved the following IPs %v as the OpenShift Router address and use %v for test", ips, ips[0])
 	return ips[0]
 }
+
 
 func TestKsvcWithServiceMeshCustomDomain(t *testing.T) {
 
@@ -543,14 +543,14 @@ func TestKsvcWithServiceMeshCustomDomain(t *testing.T) {
 	}
 
 	// Deploy a cluster-local ksvc "hello"
-	ksvc := test.Service("hello", serviceMeshTestNamespaceName, "openshift/hello-openshift", nil)
+	ksvc := test.Service("hello", testNamespace, "openshift/hello-openshift", nil)
 	ksvc.ObjectMeta.Labels = map[string]string{
 		network.VisibilityLabelKey: serving.VisibilityClusterLocal,
 	}
 	ksvc = withServiceReadyOrFail(caCtx, ksvc)
 
 	// Create the Istio Gateway for traffic via istio-ingressgateway
-	defaultGateway := test.IstioGateway("default-gateway", serviceMeshTestNamespaceName)
+	defaultGateway := test.IstioGateway("default-gateway", testNamespace)
 	test.CreateIstioGateway(caCtx, defaultGateway)
 
 	// Create the Istio VirtualService to rewrite the host header of a custom domain with the ksvc's svc hostname
@@ -616,6 +616,45 @@ func TestKsvcWithServiceMeshCustomDomain(t *testing.T) {
 
 // newSpoofClientWithTLS returns a Spoof client that always connects to the given IP address with 'customDomain' as SNI header
 func newSpoofClientWithTLS(ctx *test.Context, customDomain, ip string, certPool *x509.CertPool) (*spoof.SpoofingClient, error) {
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// We ignore the request address, force the given <IP>:80
+			return net.Dial("tcp", ip+":80")
+		},
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// We ignore the request address, force the given <IP>:443
+			conn, err := net.Dial("tcp", ip+":443")
+			if err != nil {
+				return nil, err
+			}
+
+			tlsConfig := &tls.Config{
+				RootCAs:    certPool,
+				ServerName: customDomain,
+			}
+
+			c := tls.Client(conn, tlsConfig)
+			err = c.Handshake()
+			if err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+
+			return c, nil
+		},
+	}
+
+	sc := &spoof.SpoofingClient{
+		Client:          &http.Client{Transport: transport},
+		RequestInterval: time.Second,
+		RequestTimeout:  time.Minute,
+		Logf:            ctx.T.Logf,
+	}
+
+	return sc, nil
+
+/*
 	return spoof.New(context.Background(), ctx.Clients.Kube, ctx.T.Logf, customDomain, false, ip, time.Second, time.Minute, func(transport *http.Transport) *http.Transport {
 		// Custom DialTLSContext to specify the ingress IP address, our certPool and the SNI header for the custom domain
 		transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -640,23 +679,115 @@ func newSpoofClientWithTLS(ctx *test.Context, customDomain, ip string, certPool 
 			return c, nil
 		}
 		return transport
-	})
+	})*/
 }
 
 func TestKsvcWithServiceMeshCustomTlsDomain(t *testing.T) {
 
 	const customDomain = "custom-ksvc-domain.example.com"
-	const caSecretName = "example.com"
+	const customSecretName = "custom.example.com"
 
 	caCtx := test.SetupClusterAdmin(t)
 	test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, caCtx) })
 	defer test.CleanupAll(t, caCtx)
 
+	// Generate example.com CA
+	caCertificate := &x509.Certificate{
+		SerialNumber: big.NewInt(0),
+		Subject: pkix.Name{
+			Organization:  []string{"Example Inc."},
+			CommonName: "example.com",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().AddDate(1, 0, 0),
+		IsCA:                  true,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	caPrivateKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		t.Fatalf("Error generating CA RSA key: %v", err)
+	}
+
+	caBytes, err := x509.CreateCertificate(rand.Reader, caCertificate, caCertificate, &caPrivateKey.PublicKey, caPrivateKey)
+	if err != nil {
+		t.Fatalf("Error self-signing CA Certificate: %v", err)
+	}
+
+	caPem := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: caBytes,
+	})
+
+	customCertificate := &x509.Certificate{
+		SerialNumber: big.NewInt(0),
+		Subject: pkix.Name{
+			Organization:  []string{"Example Inc."},
+		},
+		DNSNames: []string { customDomain },
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().AddDate(1, 0, 0),
+		SubjectKeyId: []byte{42},
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	customPrivateKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		t.Fatalf("Error generating Custom RSA key: %v", err)
+	}
+	customCertificateBytes, err := x509.CreateCertificate(rand.Reader, customCertificate, caCertificate, &customPrivateKey.PublicKey, caPrivateKey)
+	if err != nil {
+		t.Fatalf("Error signing Custom Certificate by CA: %v", err)
+	}
+	customPem := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: customCertificateBytes,
+	})
+	customPrivateKeyPem := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(customPrivateKey),
+	})
+
+	customSecret := &core.Secret{
+		ObjectMeta: meta.ObjectMeta{
+			Name:      customSecretName,
+			Namespace: serviceMeshTestNamespaceName,
+		},
+		Type: core.SecretTypeTLS,
+		Data: map[string][]byte{
+			core.TLSCertKey: customPem,
+			core.TLSPrivateKeyKey: customPrivateKeyPem,
+		},
+	}
+
+	customSecret, err = caCtx.Clients.Kube.CoreV1().Secrets(serviceMeshTestNamespaceName).Create(context.Background(), customSecret, meta.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating Secret %q: %v", customSecretName, err)
+	}
+	caCtx.AddToCleanup(func() error {
+		caCtx.T.Logf("Cleaning up Secret %s", customSecret.GetName())
+		return caCtx.Clients.Kube.CoreV1().Secrets(serviceMeshTestNamespaceName).Delete(context.Background(), customSecret.Name, meta.DeleteOptions{})
+	})
+
+	smcp := test.ServiceMeshControlPlaneV1("basic", serviceMeshTestNamespaceName)
+	test.AddServiceMeshControlPlaneV1IngressGatewaySecretVolume(smcp, "custom-example-com", customSecretName, "/custom.example.com")
+	test.CreateServiceMeshControlPlaneV1(caCtx, smcp)
+	test.CreateServiceMeshMemberRollV1(caCtx, test.ServiceMeshMemberRollV1("default", serviceMeshTestNamespaceName, testNamespace))
+
+	test.CreateNetworkPolicy(caCtx, test.AllowFromServingSystemNamespaceNetworkPolicy(testNamespace))
+	test.LabelNamespace(caCtx, "knative-serving", "knative.openshift.io/system-namespace", "true")
+	test.LabelNamespace(caCtx, "knative-serving-ingress", "knative.openshift.io/system-namespace", "true")
+
+	// We use v2 for readiness even with the v1 test, as v1 doesn't have conditions
+	test.WaitForServiceMeshControlPlaneV2Ready(caCtx, "basic", serviceMeshTestNamespaceName)
+
 	// Skip test if ServiceMesh not installed
-	serviceMeshNamespace := getServiceMeshNamespace(caCtx)
+
+	/*serviceMeshNamespace := getServiceMeshNamespace(caCtx)
 	if serviceMeshNamespace == "" {
 		t.Skipf("Test namespace %q not a mesh member, use \"make install-mesh\" for ServiceMesh setup", serviceMeshTestNamespaceName)
-	}
+	}*/
 
 	// Read the CA certificate for "example.com" generated by "make install-mesh"
 
@@ -667,20 +798,21 @@ func TestKsvcWithServiceMeshCustomTlsDomain(t *testing.T) {
 	// openssl x509 -req -days 365 -CA example.com.crt -CAkey example.com.key -set_serial 0 -in custom.example.com.csr -out custom.example.com.crt
 
 	// The script stores the cert in a secret called "example.com":
-	exampleSecret, err := caCtx.Clients.Kube.CoreV1().Secrets(serviceMeshNamespace).Get(context.Background(), caSecretName, meta.GetOptions{})
+	/*exampleSecret, err := caCtx.Clients.Kube.CoreV1().Secrets(serviceMeshTestNamespaceName).Get(context.Background(), caSecretName, meta.GetOptions{})
 	if errors.IsNotFound(err) {
-		t.Skipf("Secret %q in %q doesn't exist. Use \"make install-mesh\" for ServiceMesh setup.", caSecretName, serviceMeshNamespace)
+		t.Skipf("Secret %q in %q doesn't exist. Use \"make install-mesh\" for ServiceMesh setup.", caSecretName, serviceMeshTestNamespaceName)
 	}
 	if err != nil {
-		t.Fatalf("Error reading Secret %s in %s: %v", caSecretName, serviceMeshNamespace, err)
-	}
+		t.Fatalf("Error reading Secret %s in %s: %v", caSecretName, serviceMeshTestNamespaceName, err)
+	}*/
 
 	// Extract the certificate from the secret and create a CertPool
 	certPool := x509.NewCertPool()
-	certPool.AppendCertsFromPEM(exampleSecret.Data["tls.crt"])
+	//certPool.AppendCertsFromPEM(exampleSecret.Data["tls.crt"])
+	certPool.AppendCertsFromPEM(caPem)
 
 	// Deploy a cluster-local ksvc "hello"
-	ksvc := test.Service("hello", serviceMeshTestNamespaceName, "openshift/hello-openshift", nil)
+	ksvc := test.Service("hello", testNamespace, "openshift/hello-openshift", nil)
 	ksvc.ObjectMeta.Labels = map[string]string{
 		network.VisibilityLabelKey: serving.VisibilityClusterLocal,
 	}
@@ -696,7 +828,7 @@ func TestKsvcWithServiceMeshCustomTlsDomain(t *testing.T) {
 	//          secretName: custom.example.com
 	//
 	defaultGateway := test.IstioGatewayWithTLS("default-gateway",
-		serviceMeshTestNamespaceName,
+		testNamespace,
 		customDomain,
 		"/custom.example.com/tls.key",
 		"/custom.example.com/tls.crt",
@@ -716,7 +848,7 @@ func TestKsvcWithServiceMeshCustomTlsDomain(t *testing.T) {
 	route := &routev1.Route{
 		ObjectMeta: meta.ObjectMeta{
 			Name:      "hello",
-			Namespace: serviceMeshNamespace,
+			Namespace: serviceMeshTestNamespaceName,
 		},
 		Spec: routev1.RouteSpec{
 			Host: customDomain,
@@ -733,7 +865,7 @@ func TestKsvcWithServiceMeshCustomTlsDomain(t *testing.T) {
 			},
 		},
 	}
-	route, err = caCtx.Clients.Route.Routes(serviceMeshNamespace).Create(context.Background(), route, meta.CreateOptions{})
+	route, err = caCtx.Clients.Route.Routes(serviceMeshTestNamespaceName).Create(context.Background(), route, meta.CreateOptions{})
 	if err != nil {
 		t.Fatalf("Error creating OpenShift Route: %v", err)
 	}
