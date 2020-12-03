@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"knative.dev/serving/pkg/apis/autoscaling"
 	"math/big"
 	"net"
@@ -48,20 +49,24 @@ const (
 	helloworldImage              = "gcr.io/knative-samples/helloworld-go"
 	httpProxyImage               = "registry.svc.ci.openshift.org/openshift/knative-v0.17.3:knative-serving-test-httpproxy"
 	istioInjectKey               = "sidecar.istio.io/inject"
-	serviceMeshTestCustomDomain  = "custom-ksvc-domain.example.com"
 )
 
-func getServiceMeshNamespace(ctx *test.Context) string {
-	namespace, err := ctx.Clients.Kube.CoreV1().Namespaces().Get(context.Background(), testNamespace, meta.GetOptions{})
-	if err != nil {
-		ctx.T.Fatalf("Failed to verify %q namespace labels: %v", serviceMeshTestNamespaceName, err)
+func isServiceMeshInstalled(ctx *test.Context) bool {
+	_, err := ctx.Clients.Dynamic.Resource(schema.GroupVersionResource{
+		Group:    "apiextensions.k8s.io",
+		Version:  "v1",
+		Resource: "customresourcedefinitions",
+	}).Get(context.Background(), "servicemeshcontrolplanes.maistra.io", meta.GetOptions{})
+
+	if err == nil {
+		return true
 	}
 
-	return namespace.Labels["maistra.io/member-of"]
-}
+	if !errors.IsNotFound(err) {
+		ctx.T.Fatalf("Error checking if servicemeshcontrolplanes.maistra.io CRD exists: %v", err)
+	}
 
-func isServiceMeshInstalled(ctx *test.Context) bool {
-	return getServiceMeshNamespace(ctx) != ""
+	return false
 }
 
 func setupCustomDomainTlsSecret(ctx *test.Context, serviceMeshNamespace, customSecretName, customDomain string) *x509.CertPool {
@@ -151,105 +156,72 @@ func setupCustomDomainTlsSecret(ctx *test.Context, serviceMeshNamespace, customS
 	return certPool
 }
 
-func serviceMeshV1TestSetup(ctx *test.Context, serviceMeshNamespace, testNamespace string) {
-	smcp := test.ServiceMeshControlPlaneV1("basic", serviceMeshNamespace)
-	test.CreateServiceMeshControlPlaneV1(ctx, smcp)
+// Following https://docs.openshift.com/container-platform/4.6/serverless/networking/serverless-ossm.html
+func setupNamespaceForServiceMesh(ctx *test.Context, serviceMeshNamespace, testNamespace string) {
 	test.CreateServiceMeshMemberRollV1(ctx, test.ServiceMeshMemberRollV1("default", serviceMeshNamespace, testNamespace))
 
 	test.CreateNetworkPolicy(ctx, test.AllowFromServingSystemNamespaceNetworkPolicy(testNamespace))
 	test.LabelNamespace(ctx, "knative-serving", "knative.openshift.io/system-namespace", "true")
 	test.LabelNamespace(ctx, "knative-serving-ingress", "knative.openshift.io/system-namespace", "true")
-
-	// We use v2 for readiness even with the v1 test, as v1 doesn't have conditions
-	test.WaitForServiceMeshControlPlaneV2Ready(ctx, "basic", serviceMeshNamespace)
 }
 
-func serviceMeshV1WithCustomDomainTlsTestSetup(ctx *test.Context, serviceMeshNamespace, testNamespace, customDomainTlsSecretName string) {
-	smcp := test.ServiceMeshControlPlaneV1("basic", serviceMeshNamespace)
-	test.AddServiceMeshControlPlaneV1IngressGatewaySecretVolume(smcp, "custom-example-com", customDomainTlsSecretName, "/custom.example.com")
-	test.CreateServiceMeshControlPlaneV1(ctx, smcp)
-	test.CreateServiceMeshMemberRollV1(ctx, test.ServiceMeshMemberRollV1("default", serviceMeshNamespace, testNamespace))
+func runCustomDomainTlsTestForAllServiceMeshVersions(t *testing.T, customSecretName, secretVolumeName, secretVolumeMountPath string, testFunc func(ctx *test.Context)) {
+	const smcpName = "basic"
 
-	test.CreateNetworkPolicy(ctx, test.AllowFromServingSystemNamespaceNetworkPolicy(testNamespace))
-	test.LabelNamespace(ctx, "knative-serving", "knative.openshift.io/system-namespace", "true")
-	test.LabelNamespace(ctx, "knative-serving-ingress", "knative.openshift.io/system-namespace", "true")
+	type serviceMeshVersion struct {
+		name             string
+		smcpCreationFunc func(ctx *test.Context)
+	}
 
-	// We use v2 for readiness even with the v1 test, as v1 doesn't have conditions
-	test.WaitForServiceMeshControlPlaneV2Ready(ctx, "basic", serviceMeshNamespace)
-}
+	versions := []serviceMeshVersion{
+		{
+			name: "v1",
+			smcpCreationFunc: func(ctx *test.Context) {
+				smcp := test.ServiceMeshControlPlaneV1(smcpName, serviceMeshTestNamespaceName)
+				if customSecretName != "" {
+					test.AddServiceMeshControlPlaneV1IngressGatewaySecretVolume(smcp, secretVolumeName, customSecretName, secretVolumeMountPath)
+				}
+				test.CreateServiceMeshControlPlaneV1(ctx, smcp)
+			},
+		},
+		{
+			name: "v2",
+			smcpCreationFunc: func(ctx *test.Context) {
+				smcp := test.ServiceMeshControlPlaneV2(smcpName, serviceMeshTestNamespaceName)
+				if customSecretName != "" {
+					test.AddServiceMeshControlPlaneV2IngressGatewaySecretVolume(smcp, secretVolumeName, customSecretName, secretVolumeMountPath)
+				}
+				test.CreateServiceMeshControlPlaneV2(ctx, smcp)
+			},
+		},
+	}
 
-func serviceMeshV2TestSetup(ctx *test.Context, serviceMeshNamespace, testNamespace string) {
-	smcp := test.ServiceMeshControlPlaneV2("basic", serviceMeshNamespace)
-	test.CreateServiceMeshControlPlaneV2(ctx, smcp)
-	test.CreateServiceMeshMemberRollV1(ctx, test.ServiceMeshMemberRollV1("default", serviceMeshNamespace, testNamespace))
+	for _, version := range versions {
+		t.Run(version.name, func(t *testing.T) {
+			ctx := test.SetupClusterAdmin(t)
+			test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, ctx) })
+			defer test.CleanupAll(t, ctx)
 
-	test.CreateNetworkPolicy(ctx, test.AllowFromServingSystemNamespaceNetworkPolicy(testNamespace))
-	test.LabelNamespace(ctx, "knative-serving", "knative.openshift.io/system-namespace", "true")
-	test.LabelNamespace(ctx, "knative-serving-ingress", "knative.openshift.io/system-namespace", "true")
+			if !isServiceMeshInstalled(ctx) {
+				t.Skip("ServiceMeshControlPlane CRD not found, use \"make install-mesh\" to install ServiceMesh")
+			}
 
-	test.WaitForServiceMeshControlPlaneV2Ready(ctx, "basic", serviceMeshNamespace)
-}
+			// Create SMCP (version-specific)
+			version.smcpCreationFunc(ctx)
 
-func serviceMeshV2WithCustomDomainTlsTestSetup(ctx *test.Context, serviceMeshNamespace, testNamespace, customDomainTlsSecretName string) {
-	smcp := test.ServiceMeshControlPlaneV2("basic", serviceMeshNamespace)
-	test.AddServiceMeshControlPlaneV2IngressGatewaySecretVolume(smcp, "custom-example-com", customDomainTlsSecretName, "/custom.example.com")
+			// Follow documented steps to add a namespace to ServiceMesh (including NetworkPolicy setup and namespace labels)
+			setupNamespaceForServiceMesh(ctx, serviceMeshTestNamespaceName, testNamespace)
 
-	test.CreateServiceMeshControlPlaneV2(ctx, smcp)
-	test.CreateServiceMeshMemberRollV1(ctx, test.ServiceMeshMemberRollV1("default", serviceMeshNamespace, testNamespace))
+			test.WaitForServiceMeshControlPlaneReady(ctx, smcpName, serviceMeshTestNamespaceName)
 
-	test.CreateNetworkPolicy(ctx, test.AllowFromServingSystemNamespaceNetworkPolicy(testNamespace))
-	test.LabelNamespace(ctx, "knative-serving", "knative.openshift.io/system-namespace", "true")
-	test.LabelNamespace(ctx, "knative-serving-ingress", "knative.openshift.io/system-namespace", "true")
-
-	// We use v2 for readiness even with the v1 test, as v1 doesn't have conditions
-	test.WaitForServiceMeshControlPlaneV2Ready(ctx, "basic", serviceMeshNamespace)
+			// Run actual tests
+			testFunc(ctx)
+		})
+	}
 }
 
 func runTestForAllServiceMeshVersions(t *testing.T, testFunc func(ctx *test.Context)) {
-	t.Run("v1", func(t *testing.T) {
-		ctx := test.SetupClusterAdmin(t)
-		test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, ctx) })
-		defer test.CleanupAll(t, ctx)
-
-		serviceMeshV1TestSetup(ctx, serviceMeshTestNamespaceName, testNamespace)
-		testFunc(ctx)
-	})
-
-	t.Run("v2", func(t *testing.T) {
-		ctx := test.SetupClusterAdmin(t)
-		test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, ctx) })
-		defer test.CleanupAll(t, ctx)
-
-		serviceMeshV2TestSetup(ctx, serviceMeshTestNamespaceName, testNamespace)
-		testFunc(ctx)
-	})
-}
-
-func runCustomDomainTlsTestForAllServiceMeshVersions(t *testing.T, testFunc func(ctx *test.Context, certPool *x509.CertPool)) {
-	const customSecretName = "custom.example.com"
-
-	rootCtx := test.SetupClusterAdmin(t)
-	test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, rootCtx) })
-	defer test.CleanupAll(t, rootCtx)
-	certPool := setupCustomDomainTlsSecret(rootCtx, serviceMeshTestNamespaceName, customSecretName, serviceMeshTestCustomDomain)
-
-	t.Run("v1", func(t *testing.T) {
-		ctx := test.SetupClusterAdmin(t)
-		test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, ctx) })
-		defer test.CleanupAll(t, ctx)
-
-		serviceMeshV1WithCustomDomainTlsTestSetup(ctx, serviceMeshTestNamespaceName, testNamespace, customSecretName)
-		testFunc(ctx, certPool)
-	})
-
-	t.Run("v2", func(t *testing.T) {
-		ctx := test.SetupClusterAdmin(t)
-		test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, ctx) })
-		defer test.CleanupAll(t, ctx)
-
-		serviceMeshV2WithCustomDomainTlsTestSetup(ctx, serviceMeshTestNamespaceName, testNamespace, customSecretName)
-		testFunc(ctx, certPool)
-	})
+	runCustomDomainTlsTestForAllServiceMeshVersions(t, "", "", "", testFunc)
 }
 
 // A knative service acting as an "http proxy", redirects requests towards a given "host". Used to test cluster-local services
@@ -912,7 +884,19 @@ func newSpoofClientWithTLS(ctx *test.Context, customDomain, ip string, certPool 
 }
 
 func TestKsvcWithServiceMeshCustomTlsDomain(t *testing.T) {
-	runCustomDomainTlsTestForAllServiceMeshVersions(t, func(ctx *test.Context, certPool *x509.CertPool) {
+
+	const customDomain = "custom-ksvc-domain.example.com"
+	const customSecretName = "custom.example.com"
+	const secretVolumeName = "custom-example-com"
+	const secretVolumeMountPath = "/custom.example.com"
+
+	ctx := test.SetupClusterAdmin(t)
+	test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, ctx) })
+	defer test.CleanupAll(t, ctx)
+
+	certPool := setupCustomDomainTlsSecret(ctx, serviceMeshTestNamespaceName, customSecretName, customDomain)
+
+	runCustomDomainTlsTestForAllServiceMeshVersions(t, customSecretName, secretVolumeName, secretVolumeMountPath, func(ctx *test.Context) {
 		t := ctx.T
 
 		// Deploy a cluster-local ksvc "hello"
@@ -933,14 +917,14 @@ func TestKsvcWithServiceMeshCustomTlsDomain(t *testing.T) {
 		//
 		defaultGateway := test.IstioGatewayWithTLS("default-gateway",
 			testNamespace,
-			serviceMeshTestCustomDomain,
-			"/custom.example.com/tls.key",
-			"/custom.example.com/tls.crt",
+			customDomain,
+			secretVolumeMountPath+"/tls.key",
+			secretVolumeMountPath+"/tls.crt",
 		)
 		defaultGateway = test.CreateIstioGateway(ctx, defaultGateway)
 
 		// Create the Istio VirtualService to rewrite the host header of a custom domain with the ksvc's svc hostname
-		virtualService := test.IstioVirtualServiceForKnativeServiceWithCustomDomain(ksvc, defaultGateway.GetName(), serviceMeshTestCustomDomain)
+		virtualService := test.IstioVirtualServiceForKnativeServiceWithCustomDomain(ksvc, defaultGateway.GetName(), customDomain)
 		test.CreateIstioVirtualService(ctx, virtualService)
 
 		// Create the Istio ServiceEntry for ksvc's svc hostname routing towards the knative kourier-internal gateway
@@ -955,7 +939,7 @@ func TestKsvcWithServiceMeshCustomTlsDomain(t *testing.T) {
 				Namespace: serviceMeshTestNamespaceName,
 			},
 			Spec: routev1.RouteSpec{
-				Host: serviceMeshTestCustomDomain,
+				Host: customDomain,
 				Port: &routev1.RoutePort{
 					TargetPort: intstr.FromInt(8443),
 				},
@@ -982,12 +966,12 @@ func TestKsvcWithServiceMeshCustomTlsDomain(t *testing.T) {
 		// Do a spoofed HTTP request.
 		// Note, here we go via the OpenShift Router IP address, not kourier as usual with the "spoof" client.
 		routerIP := lookupOpenShiftRouterIP(ctx)
-		sc, err := newSpoofClientWithTLS(ctx, serviceMeshTestCustomDomain, routerIP.String(), certPool)
+		sc, err := newSpoofClientWithTLS(ctx, customDomain, routerIP.String(), certPool)
 		if err != nil {
 			t.Fatalf("Error creating a Spoofing Client: %v", err)
 		}
 
-		req, err := http.NewRequest(http.MethodGet, "https://"+serviceMeshTestCustomDomain, nil)
+		req, err := http.NewRequest(http.MethodGet, "https://"+customDomain, nil)
 		if err != nil {
 			t.Fatalf("Error creating an HTTPS GET request: %v", err)
 		}
@@ -1008,7 +992,7 @@ func TestKsvcWithServiceMeshCustomTlsDomain(t *testing.T) {
 
 		// As the router already returned an OK response for the HTTPS request, we assume the route is already
 		// reconciled and its 503 response really means it won't serve insecure HTTP ever.
-		req, err = http.NewRequest(http.MethodGet, "http://"+serviceMeshTestCustomDomain, nil)
+		req, err = http.NewRequest(http.MethodGet, "http://"+customDomain, nil)
 		if err != nil {
 			t.Fatalf("Error creating an HTTP GET request: %v", err)
 		}

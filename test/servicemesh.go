@@ -284,7 +284,8 @@ func CreateServiceMeshControlPlaneV2(ctx *Context, smcp *unstructured.Unstructur
 	return CreateUnstructured(ctx, serviceMeshControlPlaneV2Schema(), smcp)
 }
 
-func WaitForServiceMeshControlPlaneV2Ready(ctx *Context, name, namespace string) {
+func WaitForServiceMeshControlPlaneReady(ctx *Context, name, namespace string) {
+	// We use v2 schema for Readiness even if we install a "v.1.1" (v1 schema doesn't have "conditions")
 	_, err := WaitForUnstructuredState(ctx, serviceMeshControlPlaneV2Schema(), name, namespace, IsUnstructuredReady)
 	if err != nil {
 		ctx.T.Fatalf("Error waiting for ServiceMeshControlPlane readiness: %v", err)
