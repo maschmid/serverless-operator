@@ -27,6 +27,22 @@ func ServiceMeshControlPlaneV1(name, namespace string) *unstructured.Unstructure
 	}
 }
 
+func ServiceMeshControlPlaneV2(name, namespace string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "maistra.io/v2",
+			"kind":       "ServiceMeshControlPlane",
+			"metadata": map[string]interface{}{
+				"name":      name,
+				"namespace": namespace,
+			},
+			"spec": map[string]interface{}{
+				"version": "v2.0",
+			},
+		},
+	}
+}
+
 func AddServiceMeshControlPlaneV1IngressGatewaySecretVolume(smcp *unstructured.Unstructured, name, secretName, mountPath string) error {
 	secretVolume := make(map[string]interface{})
 	secretVolume["name"] = name
@@ -42,6 +58,23 @@ func AddServiceMeshControlPlaneV1IngressGatewaySecretVolume(smcp *unstructured.U
 	}
 
 	return unstructured.SetNestedSlice(smcp.Object, secretVolumes, "spec", "istio", "gateways", "istio-ingressgateway", "secretVolumes")
+}
+
+func AddServiceMeshControlPlaneV2IngressGatewaySecretVolume(smcp *unstructured.Unstructured, name, secretName, mountPath string) error {
+	secretVolume := make(map[string]interface{})
+	unstructured.SetNestedField(secretVolume, secretName, "volume", "secret", "secretName")
+	unstructured.SetNestedField(secretVolume, name,  "volumeMount", "name")
+	unstructured.SetNestedField(secretVolume, mountPath,  "volumeMount", "mountPath")
+
+	volumes, found, _ := unstructured.NestedSlice(smcp.Object, "spec", "gateways", "ingress", "volumes")
+	if found {
+		volumes = append(volumes, secretVolume)
+	} else {
+		volumes = make([]interface{}, 1)
+		volumes[0] = secretVolume
+	}
+
+	return unstructured.SetNestedSlice(smcp.Object, volumes, "spec", "gateways", "ingress", "volumes")
 }
 
 func ServiceMeshMemberRollV1(name, namespace string, members ...string) *unstructured.Unstructured {
@@ -241,11 +274,30 @@ func CreateServiceMeshControlPlaneV1(ctx *Context, smcp *unstructured.Unstructur
 	return CreateUnstructured(ctx, serviceMeshControlPlaneV1Schema(), smcp)
 }
 
+func CreateServiceMeshControlPlaneV2(ctx *Context, smcp *unstructured.Unstructured) *unstructured.Unstructured {
+	// When cleaning-up SMCP, wait until it doesn't exist, as it takes a while, which would break subsequent tests
+	ctx.AddToCleanup(func() error {
+		ctx.T.Logf("Waiting for ServiceMeshControlPlane %q to not exist", smcp.GetName())
+		_, err := WaitForUnstructuredState(ctx, serviceMeshControlPlaneV2Schema(), smcp.GetName(), smcp.GetNamespace(), DoesUnstructuredNotExist)
+		return err
+	})
+	return CreateUnstructured(ctx, serviceMeshControlPlaneV2Schema(), smcp)
+}
+
 func WaitForServiceMeshControlPlaneV2Ready(ctx *Context, name, namespace string) {
 	_, err := WaitForUnstructuredState(ctx, serviceMeshControlPlaneV2Schema(), name, namespace, IsUnstructuredReady)
 	if err != nil {
 		ctx.T.Fatalf("Error waiting for ServiceMeshControlPlane readiness: %v", err)
 	}
+}
+
+func GetServiceMeshControlPlaneVersion(ctx *Context, name, namespace string) (string, bool, error) {
+	smcp, err := ctx.Clients.Dynamic.Resource(serviceMeshControlPlaneV2Schema()).Namespace(namespace).Get(context.Background(), name, meta.GetOptions{})
+	if err != nil {
+		ctx.T.Fatalf("Error getting SMCP %s: %v", name, err)
+	}
+
+	return unstructured.NestedString(smcp.Object, "spec", "version")
 }
 
 func CreateServiceMeshMemberRollV1(ctx *Context, smmr *unstructured.Unstructured) *unstructured.Unstructured {

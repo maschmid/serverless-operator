@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
+	"knative.dev/serving/pkg/apis/autoscaling"
 	"math/big"
 	"net"
 	"net/http"
@@ -31,7 +32,6 @@ import (
 	pkgTest "knative.dev/pkg/test"
 	"knative.dev/pkg/test/helpers"
 	"knative.dev/pkg/test/spoof"
-	"knative.dev/serving/pkg/apis/autoscaling"
 	"knative.dev/serving/pkg/apis/serving"
 	servingv1 "knative.dev/serving/pkg/apis/serving/v1"
 )
@@ -178,12 +178,78 @@ func serviceMeshV1WithCustomDomainTlsTestSetup(ctx *test.Context, serviceMeshNam
 	test.WaitForServiceMeshControlPlaneV2Ready(ctx, "basic", serviceMeshNamespace)
 }
 
-func serviceMeshV2TestSetup(ctx *test.Context) {
+func serviceMeshV2TestSetup(ctx *test.Context, serviceMeshNamespace, testNamespace string) {
+	smcp := test.ServiceMeshControlPlaneV2("basic", serviceMeshNamespace)
+	test.CreateServiceMeshControlPlaneV2(ctx, smcp)
+	test.CreateServiceMeshMemberRollV1(ctx, test.ServiceMeshMemberRollV1("default", serviceMeshNamespace, testNamespace))
 
+	test.CreateNetworkPolicy(ctx, test.AllowFromServingSystemNamespaceNetworkPolicy(testNamespace))
+	test.LabelNamespace(ctx, "knative-serving", "knative.openshift.io/system-namespace", "true")
+	test.LabelNamespace(ctx, "knative-serving-ingress", "knative.openshift.io/system-namespace", "true")
+
+	test.WaitForServiceMeshControlPlaneV2Ready(ctx, "basic", serviceMeshNamespace)
 }
 
-func serviceMeshV2WithCustomDomainTlsTestSetup(ctx *test.Context) *x509.CertPool {
-	return nil
+func serviceMeshV2WithCustomDomainTlsTestSetup(ctx *test.Context, serviceMeshNamespace, testNamespace, customDomainTlsSecretName string) {
+	smcp := test.ServiceMeshControlPlaneV2("basic", serviceMeshNamespace)
+	test.AddServiceMeshControlPlaneV2IngressGatewaySecretVolume(smcp, "custom-example-com", customDomainTlsSecretName, "/custom.example.com")
+
+	test.CreateServiceMeshControlPlaneV2(ctx, smcp)
+	test.CreateServiceMeshMemberRollV1(ctx, test.ServiceMeshMemberRollV1("default", serviceMeshNamespace, testNamespace))
+
+	test.CreateNetworkPolicy(ctx, test.AllowFromServingSystemNamespaceNetworkPolicy(testNamespace))
+	test.LabelNamespace(ctx, "knative-serving", "knative.openshift.io/system-namespace", "true")
+	test.LabelNamespace(ctx, "knative-serving-ingress", "knative.openshift.io/system-namespace", "true")
+
+	// We use v2 for readiness even with the v1 test, as v1 doesn't have conditions
+	test.WaitForServiceMeshControlPlaneV2Ready(ctx, "basic", serviceMeshNamespace)
+}
+
+func runTestForAllServiceMeshVersions(t *testing.T, testFunc func(ctx *test.Context)) {
+	t.Run("v1", func(t *testing.T) {
+		ctx := test.SetupClusterAdmin(t)
+		test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, ctx) })
+		defer test.CleanupAll(t, ctx)
+
+		serviceMeshV1TestSetup(ctx, serviceMeshTestNamespaceName, testNamespace)
+		testFunc(ctx)
+	})
+
+	t.Run("v2", func(t *testing.T) {
+		ctx := test.SetupClusterAdmin(t)
+		test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, ctx) })
+		defer test.CleanupAll(t, ctx)
+
+		serviceMeshV2TestSetup(ctx, serviceMeshTestNamespaceName, testNamespace)
+		testFunc(ctx)
+	})
+}
+
+func runCustomDomainTlsTestForAllServiceMeshVersions(t *testing.T, testFunc func(ctx *test.Context, certPool *x509.CertPool)) {
+	const customSecretName = "custom.example.com"
+
+	rootCtx := test.SetupClusterAdmin(t)
+	test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, rootCtx) })
+	defer test.CleanupAll(t, rootCtx)
+	certPool := setupCustomDomainTlsSecret(rootCtx, serviceMeshTestNamespaceName, customSecretName, serviceMeshTestCustomDomain)
+
+	t.Run("v1", func(t *testing.T) {
+		ctx := test.SetupClusterAdmin(t)
+		test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, ctx) })
+		defer test.CleanupAll(t, ctx)
+
+		serviceMeshV1WithCustomDomainTlsTestSetup(ctx, serviceMeshTestNamespaceName, testNamespace, customSecretName)
+		testFunc(ctx, certPool)
+	})
+
+	t.Run("v2", func(t *testing.T) {
+		ctx := test.SetupClusterAdmin(t)
+		test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, ctx) })
+		defer test.CleanupAll(t, ctx)
+
+		serviceMeshV2WithCustomDomainTlsTestSetup(ctx, serviceMeshTestNamespaceName, testNamespace, customSecretName)
+		testFunc(ctx, certPool)
+	})
 }
 
 // A knative service acting as an "http proxy", redirects requests towards a given "host". Used to test cluster-local services
@@ -199,72 +265,64 @@ func httpProxyService(name, namespace, host string) *servingv1.Service {
 
 // Skipped unless ServiceMesh has been installed via "make install-mesh"
 func TestKsvcWithServiceMeshSidecar(t *testing.T) {
+	runTestForAllServiceMeshVersions(t, func(ctx *test.Context) {
+		tests := []testCase{{
+			// Requests go via gateway -> activator -> pod , by default
+			// Verifies the activator can connect to the pod
+			name: "sidecar-via-activator",
+			annotations: map[string]string{
+				istioInjectKey:                     "true",
+				autoscaling.TargetBurstCapacityKey: "-1",
+			},
+			expectIstioSidecar: true,
+		}, {
+			// Requests go via gateway -> pod ( activator should be skipped if burst capacity is disabled and there is at least 1 replica)
+			// Verifies the gateway can connect to the pod directly
+			name: "sidecar-without-activator",
+			annotations: map[string]string{
+				istioInjectKey:                     "true",
+				autoscaling.TargetBurstCapacityKey: "0",
+				autoscaling.MinScaleAnnotationKey:  "1",
+			},
+			expectIstioSidecar: true,
+		}, {
+			// Verifies the "sidecar.istio.io/inject" annotation is really what decides the istio-proxy presence
+			name: "no-sidecar",
+			annotations: map[string]string{
+				istioInjectKey: "false",
+			},
+			expectIstioSidecar: false,
+		}, {
+			// A cluster-local variant of the "sidecar-via-activator" scenario
+			name: "local-sidecar-via-activator",
+			labels: map[string]string{
+				network.VisibilityLabelKey: serving.VisibilityClusterLocal,
+			},
+			annotations: map[string]string{
+				istioInjectKey: "true",
+			},
+			expectIstioSidecar: true,
+		}, {
+			// A cluster-local variant of the "sidecar-without-activator" scenario
+			name: "local-sidecar-without-activator",
+			labels: map[string]string{
+				network.VisibilityLabelKey: serving.VisibilityClusterLocal,
+			},
+			annotations: map[string]string{
+				istioInjectKey:                     "true",
+				autoscaling.TargetBurstCapacityKey: "0",
+				autoscaling.MinScaleAnnotationKey:  "1",
+			},
+			expectIstioSidecar: true,
+		}}
 
-	caCtx := test.SetupClusterAdmin(t)
-	test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, caCtx) })
-	defer test.CleanupAll(t, caCtx)
-
-	// Skip test if ServiceMesh not installed
-	if !isServiceMeshInstalled(caCtx) {
-		t.Skipf("Test namespace %q not a mesh member, use \"make install-mesh\" for ServiceMesh setup", serviceMeshTestNamespaceName)
-	}
-
-	tests := []testCase{{
-		// Requests go via gateway -> activator -> pod , by default
-		// Verifies the activator can connect to the pod
-		name: "sidecar-via-activator",
-		annotations: map[string]string{
-			istioInjectKey:                     "true",
-			autoscaling.TargetBurstCapacityKey: "-1",
-		},
-		expectIstioSidecar: true,
-	}, {
-		// Requests go via gateway -> pod ( activator should be skipped if burst capacity is disabled and there is at least 1 replica)
-		// Verifies the gateway can connect to the pod directly
-		name: "sidecar-without-activator",
-		annotations: map[string]string{
-			istioInjectKey:                     "true",
-			autoscaling.TargetBurstCapacityKey: "0",
-			autoscaling.MinScaleAnnotationKey:  "1",
-		},
-		expectIstioSidecar: true,
-	}, {
-		// Verifies the "sidecar.istio.io/inject" annotation is really what decides the istio-proxy presence
-		name: "no-sidecar",
-		annotations: map[string]string{
-			istioInjectKey: "false",
-		},
-		expectIstioSidecar: false,
-	}, {
-		// A cluster-local variant of the "sidecar-via-activator" scenario
-		name: "local-sidecar-via-activator",
-		labels: map[string]string{
-			network.VisibilityLabelKey: serving.VisibilityClusterLocal,
-		},
-		annotations: map[string]string{
-			istioInjectKey: "true",
-		},
-		expectIstioSidecar: true,
-	}, {
-		// A cluster-local variant of the "sidecar-without-activator" scenario
-		name: "local-sidecar-without-activator",
-		labels: map[string]string{
-			network.VisibilityLabelKey: serving.VisibilityClusterLocal,
-		},
-		annotations: map[string]string{
-			istioInjectKey:                     "true",
-			autoscaling.TargetBurstCapacityKey: "0",
-			autoscaling.MinScaleAnnotationKey:  "1",
-		},
-		expectIstioSidecar: true,
-	}}
-
-	for _, scenario := range tests {
-		scenario := scenario
-		t.Run(scenario.name, func(t *testing.T) {
-			testServiceToService(t, caCtx, serviceMeshTestNamespaceName, scenario)
-		})
-	}
+		for _, scenario := range tests {
+			scenario := scenario
+			t.Run(scenario.name, func(t *testing.T) {
+				testServiceToService(t, ctx, testNamespace, scenario)
+			})
+		}
+	})
 }
 
 // formats an RSA public key as JWKS
@@ -375,86 +433,87 @@ func jwtHTTPGetRequestBytes(url string, token *string) (*http.Response, []byte, 
 // via istio authentication Policy to allow valid JWT only.
 // Skipped unless ServiceMesh has been installed via "make install-mesh"
 func TestKsvcWithServiceMeshJWTDefaultPolicy(t *testing.T) {
+	runTestForAllServiceMeshVersions(t, func(ctx *test.Context) {
+		t := ctx.T
+		privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatalf("Error generating private key: %v", err)
+		}
 
-	caCtx := test.SetupClusterAdmin(t)
-	test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, caCtx) })
-	defer test.CleanupAll(t, caCtx)
+		// print out the public key for debugging purposes
+		publicPksvc1, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+		if err != nil {
+			t.Fatalf("Error marshalling public key: %v", err)
+		}
+		publicPem := pem.EncodeToMemory(&pem.Block{
+			Type:  "RSA PUBLIC KEY",
+			Bytes: publicPksvc1,
+		})
+		t.Logf("%s", string(publicPem))
 
-	serviceMeshV1TestSetup(caCtx, serviceMeshTestNamespaceName, testNamespace)
+		// Used as "kid" in JWKS
+		const keyID = "test"
+		const issuer = "testing-issuer@secure.serverless.openshift.io"
+		const subject = "testing-subject@secure.serverless.openshift.io"
+		// For testing an invalid token (with a different issuer)
+		const wrongIssuer = "eve@secure.serverless.openshift.io"
 
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("Error generating private key: %v", err)
-	}
+		// Generate a new key for a "wrong key" scenario
+		wrongKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatalf("Error generating private key: %v", err)
+		}
 
-	// print out the public key for debugging purposes
-	publicPksvc1, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
-	if err != nil {
-		t.Fatalf("Error marshalling public key: %v", err)
-	}
-	publicPem := pem.EncodeToMemory(&pem.Block{
-		Type:  "RSA PUBLIC KEY",
-		Bytes: publicPksvc1,
-	})
-	t.Logf("%s", string(publicPem))
+		jwks, err := rsaPublicKeyAsJwks(privateKey.PublicKey, keyID)
+		if err != nil {
+			t.Fatalf("Error encoding RSA public key as JWKS: %v", err)
+		}
 
-	// Used as "kid" in JWKS
-	const keyID = "test"
-	const issuer = "testing-issuer@secure.serverless.openshift.io"
-	const subject = "testing-subject@secure.serverless.openshift.io"
-	// For testing an invalid token (with a different issuer)
-	const wrongIssuer = "eve@secure.serverless.openshift.io"
+		// Istio 1.1 and earlier lack "jwks" option, only "jwksUri", so we need to host it on some URL
+		// We'll misuse the "hello-openshift" image with the JWKS file defined as the RESPONSE env, and deploy this as a ksvc
 
-	// Generate a new key for a "wrong key" scenario
-	wrongKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("Error generating private key: %v", err)
-	}
+		// istio-pilot caches the JWKS content if a new Policy has the same jwksUri as some old policy.
+		// Rerunning this test would fail if we kept the jwksUri constant across invocations then,
+		// hence the random suffix for the jwks ksvc.
+		jwksKsvc := test.Service(helpers.AppendRandomString("jwks"), testNamespace, "openshift/hello-openshift", nil)
+		jwksKsvc.Spec.Template.Spec.Containers[0].Env = append(jwksKsvc.Spec.Template.Spec.Containers[0].Env, core.EnvVar{
+			Name:  "RESPONSE",
+			Value: jwks,
+		})
+		jwksKsvc.ObjectMeta.Labels = map[string]string{
+			network.VisibilityLabelKey: serving.VisibilityClusterLocal,
+		}
+		jwksKsvc = withServiceReadyOrFail(ctx, jwksKsvc)
 
-	jwks, err := rsaPublicKeyAsJwks(privateKey.PublicKey, keyID)
-	if err != nil {
-		t.Fatalf("Error encoding RSA public key as JWKS: %v", err)
-	}
-
-	// Istio 1.1 and earlier lack "jwks" option, only "jwksUri", so we need to host it on some URL
-	// We'll misuse the "hello-openshift" image with the JWKS file defined as the RESPONSE env, and deploy this as a ksvc
-
-	// istio-pilot caches the JWKS content if a new Policy has the same jwksUri as some old policy.
-	// Rerunning this test would fail if we kept the jwksUri constant across invocations then,
-	// hence the random suffix for the jwks ksvc.
-	jwksKsvc := test.Service(helpers.AppendRandomString("jwks"), testNamespace, "openshift/hello-openshift", nil)
-	jwksKsvc.Spec.Template.Spec.Containers[0].Env = append(jwksKsvc.Spec.Template.Spec.Containers[0].Env, core.EnvVar{
-		Name:  "RESPONSE",
-		Value: jwks,
-	})
-	jwksKsvc.ObjectMeta.Labels = map[string]string{
-		network.VisibilityLabelKey: serving.VisibilityClusterLocal,
-	}
-	jwksKsvc = withServiceReadyOrFail(caCtx, jwksKsvc)
-
-	// Create a Policy
-	authPolicy := &unstructured.Unstructured{
-		Object: map[string]interface{}{
-			"apiVersion": "authentication.istio.io/v1alpha1",
-			"kind":       "Policy",
-			"metadata": map[string]interface{}{
-				"name": "default",
-			},
-			"spec": map[string]interface{}{
-				"principalBinding": "USE_ORIGIN",
-				"origins": []map[string]interface{}{
-					{
-						"jwt": map[string]interface{}{
-							"issuer":  issuer,
-							"jwksUri": jwksKsvc.Status.URL,
-							"triggerRules": []map[string]interface{}{
-								{
-									"excludedPaths": []map[string]interface{}{
+		smcpVersion, _, _ := test.GetServiceMeshControlPlaneVersion(ctx, "basic", serviceMeshTestNamespaceName)
+		// If "version" exists and is a v1, use the obsolete "Policy"
+		if strings.HasPrefix(smcpVersion, "v1.") {
+			// Create a Policy
+			authPolicy := &unstructured.Unstructured{
+				Object: map[string]interface{}{
+					"apiVersion": "authentication.istio.io/v1alpha1",
+					"kind":       "Policy",
+					"metadata": map[string]interface{}{
+						"name": "default",
+						"namespace": testNamespace,
+					},
+					"spec": map[string]interface{}{
+						"principalBinding": "USE_ORIGIN",
+						"origins": []map[string]interface{}{
+							{
+								"jwt": map[string]interface{}{
+									"issuer":  issuer,
+									"jwksUri": jwksKsvc.Status.URL,
+									"triggerRules": []map[string]interface{}{
 										{
-											"prefix": "/metrics",
-										},
-										{
-											"prefix": "/healthz",
+											"excludedPaths": []map[string]interface{}{
+												{
+													"prefix": "/metrics",
+												},
+												{
+													"prefix": "/healthz",
+												},
+											},
 										},
 									},
 								},
@@ -462,172 +521,257 @@ func TestKsvcWithServiceMeshJWTDefaultPolicy(t *testing.T) {
 						},
 					},
 				},
-			},
-		},
-	}
-
-	policyGvr := schema.GroupVersionResource{
-		Group:    "authentication.istio.io",
-		Version:  "v1alpha1",
-		Resource: "policies",
-	}
-
-	authPolicy, err = caCtx.Clients.Dynamic.Resource(policyGvr).Namespace(testNamespace).Create(context.Background(), authPolicy, meta.CreateOptions{})
-	if err != nil {
-		t.Fatalf("Error creating istio Policy: %v", err)
-	}
-
-	caCtx.AddToCleanup(func() error {
-		t.Logf("Cleaning up istio Policy default")
-		return caCtx.Clients.Dynamic.Resource(policyGvr).Namespace(authPolicy.GetNamespace()).Delete(context.Background(), authPolicy.GetName(), meta.DeleteOptions{})
-	})
-
-	// Create a test ksvc, should be accessible only via proper JWT token
-	testKsvc := test.Service("jwt-test", testNamespace, image, map[string]string{
-		"sidecar.istio.io/inject": "true",
-	})
-	testKsvc = withServiceReadyOrFail(caCtx, testKsvc)
-
-	// Wait until the Route is ready and also verify the route returns a 401 without a token
-	if _, err := pkgTest.WaitForEndpointState(
-		context.Background(),
-		&pkgTest.KubeClient{Kube: caCtx.Clients.Kube},
-		t.Logf,
-		testKsvc.Status.URL.URL(),
-		func(resp *spoof.Response) (bool, error) {
-			if resp.StatusCode != 401 {
-				// Returning (false, nil) causes SpoofingClient.Poll to retry.
-				return false, nil
 			}
-			return true, nil
-		},
-		"WaitForRouteToServe401",
-		true); err != nil {
-		t.Fatalf("The Route at domain %s didn't serve the expected HTTP 401 status: %v", testKsvc.Status.URL.URL(), err)
-	}
 
-	tests := []struct {
-		name    string
-		valid   bool // Is the token expected to be valid?
-		key     *rsa.PrivateKey
-		payload map[string]interface{}
-	}{{
-		// A valid token
-		"valid",
-		true,
-		privateKey,
-		map[string]interface{}{
-			"iss": issuer,
-			"sub": subject,
-			"foo": "bar",
-			"iat": time.Now().Unix(),
-			"exp": time.Now().Unix() + 3600,
-		},
-	},
-		{
-			// No token (request will be done without the Authorization header)
-			"no_token",
-			false,
-			nil,
-			nil,
-		},
-		{
-			// Unsigned token
-			"unsigned",
-			false,
-			nil,
-			map[string]interface{}{
-				"iss": issuer,
-				"sub": subject,
-				"foo": "bar",
-				"iat": time.Now().Unix(),
-				"exp": time.Now().Unix() + 3600,
+			policyGvr := schema.GroupVersionResource{
+				Group:    "authentication.istio.io",
+				Version:  "v1alpha1",
+				Resource: "policies",
+			}
+
+			test.CreateUnstructured(ctx, policyGvr, authPolicy)
+		} else {
+			// On SMCP v.2.x and later, Create RequestAuthentication and AuthorizationPolicies
+			jwtExampleRA := &unstructured.Unstructured{
+				Object: map[string]interface{}{
+					"apiVersion": "security.istio.io/v1beta1",
+					"kind":       "RequestAuthentication",
+					"metadata": map[string]interface{}{
+						"name": "jwt-example",
+						"namespace": testNamespace,
+					},
+					"spec": map[string]interface{}{
+						"jwtRules": []map[string]interface{}{
+							{
+								"issuer": issuer,
+								"jwksUri": jwksKsvc.Status.URL,
+							},
+						},
+					},
+				},
+			}
+
+			requestAuthenticationGvr := schema.GroupVersionResource{
+				Group:    "security.istio.io",
+				Version:  "v1beta1",
+				Resource: "requestauthentications",
+			}
+
+			test.CreateUnstructured(ctx, requestAuthenticationGvr, jwtExampleRA)
+
+			allowListByPathsAP := &unstructured.Unstructured{
+				Object: map[string]interface{}{
+					"apiVersion": "security.istio.io/v1beta1",
+					"kind":       "AuthorizationPolicy",
+					"metadata": map[string]interface{}{
+						"name": "allowlist-by-paths",
+						"namespace": testNamespace,
+					},
+					"spec": map[string]interface{}{
+						"action": "ALLOW",
+						"rules": []map[string]interface{}{
+							{
+								"to":  []map[string]interface{}{
+									{
+										"operation": map[string]interface{}{
+											"paths": []string{
+												"/metrics",
+												"/healthz",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			authorizationPolicyGvr := schema.GroupVersionResource{
+				Group:    "security.istio.io",
+				Version:  "v1beta1",
+				Resource: "authorizationpolicies",
+			}
+
+			test.CreateUnstructured(ctx, authorizationPolicyGvr, allowListByPathsAP)
+
+			requireJwtAP := &unstructured.Unstructured{
+				Object: map[string]interface{}{
+					"apiVersion": "security.istio.io/v1beta1",
+					"kind":       "AuthorizationPolicy",
+					"metadata": map[string]interface{}{
+						"name": "require-jwt",
+						"namespace": testNamespace,
+					},
+					"spec": map[string]interface{}{
+						"action": "ALLOW",
+						"rules": []map[string]interface{}{
+							{
+								"from":  []map[string]interface{}{
+									{
+										"source": map[string]interface{}{
+											"requestPrincipals": []string{
+												issuer + "/" + subject,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			test.CreateUnstructured(ctx, authorizationPolicyGvr, requireJwtAP)
+		}
+
+		// Create a test ksvc, should be accessible only via proper JWT token
+		testKsvc := test.Service("jwt-test", testNamespace, image, map[string]string{
+			"sidecar.istio.io/inject": "true",
+		})
+		testKsvc = withServiceReadyOrFail(ctx, testKsvc)
+
+		// Wait until the Route is ready and also verify the route returns a 401 or 403 without a token
+		if _, err := pkgTest.WaitForEndpointState(
+			context.Background(),
+			&pkgTest.KubeClient{Kube: ctx.Clients.Kube},
+			t.Logf,
+			testKsvc.Status.URL.URL(),
+			func(resp *spoof.Response) (bool, error) {
+				if resp.StatusCode != 401 && resp.StatusCode != 403 {
+					// Returning (false, nil) causes SpoofingClient.Poll to retry.
+					return false, nil
+				}
+				return true, nil
 			},
-		},
-		{
-			// A token with "exp" time in the past
-			"expired",
-			false,
+			"WaitForRouteToServe401Or403",
+			true); err != nil {
+			t.Fatalf("The Route at domain %s didn't serve the expected HTTP 401 or 403 status: %v", testKsvc.Status.URL.URL(), err)
+		}
+
+		tests := []struct {
+			name    string
+			valid   bool // Is the token expected to be valid?
+			key     *rsa.PrivateKey
+			payload map[string]interface{}
+		}{{
+			// A valid token
+			"valid",
+			true,
 			privateKey,
 			map[string]interface{}{
 				"iss": issuer,
 				"sub": subject,
 				"foo": "bar",
-				// as if generated before an hour, expiring 10 seconds ago
-				"iat": time.Now().Unix() - 3600,
-				"exp": time.Now().Unix() - 10,
-			},
-		}, {
-			// A token signed by a different key
-			"bad_key",
-			false,
-			wrongKey,
-			map[string]interface{}{
-				"iss": issuer,
-				"sub": subject,
-				"foo": "bar",
 				"iat": time.Now().Unix(),
 				"exp": time.Now().Unix() + 3600,
 			},
-		}, {
-			// A token with an issuer set to a different principal than the one specified in the Policy
-			"bad_iss",
-			false,
-			privateKey,
-			map[string]interface{}{
-				"iss": wrongIssuer,
-				"sub": subject,
-				"foo": "bar",
-				"iat": time.Now().Unix(),
-				"exp": time.Now().Unix() + 3600,
+		},
+			{
+				// No token (request will be done without the Authorization header)
+				"no_token",
+				false,
+				nil,
+				nil,
 			},
-		}}
+			{
+				// Unsigned token
+				"unsigned",
+				false,
+				nil,
+				map[string]interface{}{
+					"iss": issuer,
+					"sub": subject,
+					"foo": "bar",
+					"iat": time.Now().Unix(),
+					"exp": time.Now().Unix() + 3600,
+				},
+			},
+			{
+				// A token with "exp" time in the past
+				"expired",
+				false,
+				privateKey,
+				map[string]interface{}{
+					"iss": issuer,
+					"sub": subject,
+					"foo": "bar",
+					// as if generated before an hour, expiring 10 seconds ago
+					"iat": time.Now().Unix() - 3600,
+					"exp": time.Now().Unix() - 10,
+				},
+			}, {
+				// A token signed by a different key
+				"bad_key",
+				false,
+				wrongKey,
+				map[string]interface{}{
+					"iss": issuer,
+					"sub": subject,
+					"foo": "bar",
+					"iat": time.Now().Unix(),
+					"exp": time.Now().Unix() + 3600,
+				},
+			}, {
+				// A token with an issuer set to a different principal than the one specified in the Policy
+				"bad_iss",
+				false,
+				privateKey,
+				map[string]interface{}{
+					"iss": wrongIssuer,
+					"sub": subject,
+					"foo": "bar",
+					"iat": time.Now().Unix(),
+					"exp": time.Now().Unix() + 3600,
+				},
+			}}
 
-	for _, scenario := range tests {
-		scenario := scenario
-		t.Run(scenario.name, func(t *testing.T) {
-			var tokenRef *string
-			var err error
+		for _, scenario := range tests {
+			scenario := scenario
+			t.Run(scenario.name, func(t *testing.T) {
+				var tokenRef *string
+				var err error
 
-			// nil payload means no token (in which case we don't send "Authorization" header at all)
-			if scenario.payload != nil {
-				var token string
-				if scenario.key != nil {
-					// Generate a signed RS256 token
-					token, err = jwtRs256Token(scenario.key, scenario.payload)
-					if err != nil {
-						t.Fatalf("Error generating RS256 token: %v", err)
+				// nil payload means no token (in which case we don't send "Authorization" header at all)
+				if scenario.payload != nil {
+					var token string
+					if scenario.key != nil {
+						// Generate a signed RS256 token
+						token, err = jwtRs256Token(scenario.key, scenario.payload)
+						if err != nil {
+							t.Fatalf("Error generating RS256 token: %v", err)
+						}
+					} else {
+						// Generate an unsigned token if RSA key not specified
+						token, err = jwtUnsignedToken(scenario.payload)
+						if err != nil {
+							t.Fatalf("Error generating an unsigned token: %v", err)
+						}
+					}
+
+					tokenRef = &token
+				}
+
+				// Do a request, optionally with a token
+				resp, body, err := jwtHTTPGetRequestBytes(testKsvc.Status.URL.String(), tokenRef)
+				if err != nil {
+					t.Fatalf("Error doing HTTP GET request: %v", err)
+				}
+
+				if scenario.valid {
+					// Verify the response is a proper "hello world" when the token is valid
+					if resp.StatusCode != 200 || !strings.Contains(string(body), helloworldText) {
+						t.Fatalf("Unexpected response with a valid token: HTTP %d: %s", resp.StatusCode, string(body))
 					}
 				} else {
-					// Generate an unsigned token if RSA key not specified
-					token, err = jwtUnsignedToken(scenario.payload)
-					if err != nil {
-						t.Fatalf("Error generating an unsigned token: %v", err)
+					// Verify the response is a 401 or a 403 for an invalid token
+					if resp.StatusCode != 401 && resp.StatusCode != 403 {
+						t.Fatalf("Unexpected response with an invalid token, expecting 401 or 403, got %d: %s", resp.StatusCode, string(body))
 					}
 				}
-
-				tokenRef = &token
-			}
-
-			// Do a request, optionally with a token
-			resp, body, err := jwtHTTPGetRequestBytes(testKsvc.Status.URL.String(), tokenRef)
-			if err != nil {
-				t.Fatalf("Error doing HTTP GET request: %v", err)
-			}
-
-			if scenario.valid {
-				// Verify the response is a proper "hello world" when the token is valid
-				if resp.StatusCode != 200 || !strings.Contains(string(body), helloworldText) {
-					t.Fatalf("Unexpected response with a valid token: HTTP %d: %s", resp.StatusCode, string(body))
-				}
-			} else {
-				// Verify the response is a 401 for an invalid token
-				if resp.StatusCode != 401 {
-					t.Fatalf("Unexpected response with an invalid token, expecting 401, got %d: %s", resp.StatusCode, string(body))
-				}
-			}
-		})
-	}
+			})
+		}
+	})
 }
 
 func lookupOpenShiftRouterIP(ctx *test.Context) net.IP {
@@ -649,85 +793,82 @@ func lookupOpenShiftRouterIP(ctx *test.Context) net.IP {
 
 
 func TestKsvcWithServiceMeshCustomDomain(t *testing.T) {
-
 	const customDomain = "custom-ksvc-domain.example.com"
 
-	caCtx := test.SetupClusterAdmin(t)
-	test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, caCtx) })
-	defer test.CleanupAll(t, caCtx)
+	runTestForAllServiceMeshVersions(t, func(ctx *test.Context) {
+		t := ctx.T
 
-	serviceMeshV1TestSetup(caCtx, serviceMeshTestNamespaceName, testNamespace)
+		// Deploy a cluster-local ksvc "hello"
+		ksvc := test.Service("hello", testNamespace, "openshift/hello-openshift", nil)
+		ksvc.ObjectMeta.Labels = map[string]string{
+			network.VisibilityLabelKey: serving.VisibilityClusterLocal,
+		}
+		ksvc = withServiceReadyOrFail(ctx, ksvc)
 
-	// Deploy a cluster-local ksvc "hello"
-	ksvc := test.Service("hello", testNamespace, "openshift/hello-openshift", nil)
-	ksvc.ObjectMeta.Labels = map[string]string{
-		network.VisibilityLabelKey: serving.VisibilityClusterLocal,
-	}
-	ksvc = withServiceReadyOrFail(caCtx, ksvc)
+		// Create the Istio Gateway for traffic via istio-ingressgateway
+		defaultGateway := test.IstioGateway("default-gateway", testNamespace)
+		test.CreateIstioGateway(ctx, defaultGateway)
 
-	// Create the Istio Gateway for traffic via istio-ingressgateway
-	defaultGateway := test.IstioGateway("default-gateway", testNamespace)
-	test.CreateIstioGateway(caCtx, defaultGateway)
+		// Create the Istio VirtualService to rewrite the host header of a custom domain with the ksvc's svc hostname
+		virtualService := test.IstioVirtualServiceForKnativeServiceWithCustomDomain(ksvc, defaultGateway.GetName(), customDomain)
+		test.CreateIstioVirtualService(ctx, virtualService)
 
-	// Create the Istio VirtualService to rewrite the host header of a custom domain with the ksvc's svc hostname
-	virtualService := test.IstioVirtualServiceForKnativeServiceWithCustomDomain(ksvc, defaultGateway.GetName(), customDomain)
-	test.CreateIstioVirtualService(caCtx, virtualService)
+		// Create the Istio ServiceEntry for ksvc's svc hostname routing towards the knative kourier-internal gateway
+		serviceEntry := test.IstioServiceEntryForKnativeServiceTowardsKourier(ksvc)
+		test.CreateIstioServiceEntry(ctx, serviceEntry)
 
-	// Create the Istio ServiceEntry for ksvc's svc hostname routing towards the knative kourier-internal gateway
-	serviceEntry := test.IstioServiceEntryForKnativeServiceTowardsKourier(ksvc)
-	test.CreateIstioServiceEntry(caCtx, serviceEntry)
-
-	// Create the OpenShift Route for the custom domain pointing to the istio-ingressgateway
-	// Note, this one is created in the service mesh namespace ("istio-system"), not the test namespace
-	route := &routev1.Route{
-		ObjectMeta: meta.ObjectMeta{
-			Name:      "hello",
-			Namespace: serviceMeshTestNamespaceName,
-		},
-		Spec: routev1.RouteSpec{
-			Host: customDomain,
-			Port: &routev1.RoutePort{
-				TargetPort: intstr.FromInt(8080),
+		// Create the OpenShift Route for the custom domain pointing to the istio-ingressgateway
+		// Note, this one is created in the service mesh namespace ("istio-system"), not the test namespace
+		route := &routev1.Route{
+			ObjectMeta: meta.ObjectMeta{
+				Name:      "hello",
+				Namespace: serviceMeshTestNamespaceName,
 			},
-			To: routev1.RouteTargetReference{
-				Kind: "Service",
-				Name: "istio-ingressgateway",
+			Spec: routev1.RouteSpec{
+				Host: customDomain,
+				Port: &routev1.RoutePort{
+					TargetPort: intstr.FromInt(8080),
+				},
+				To: routev1.RouteTargetReference{
+					Kind: "Service",
+					Name: "istio-ingressgateway",
+				},
 			},
-		},
-	}
-	route, err := caCtx.Clients.Route.Routes(serviceMeshTestNamespaceName).Create(context.Background(), route, meta.CreateOptions{})
-	if err != nil {
-		t.Fatalf("Error creating OpenShift Route: %v", err)
-	}
+		}
+		route, err := ctx.Clients.Route.Routes(serviceMeshTestNamespaceName).Create(context.Background(), route, meta.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Error creating OpenShift Route: %v", err)
+		}
 
-	caCtx.AddToCleanup(func() error {
-		t.Logf("Cleaning up OpenShift Route %s", route.GetName())
-		return caCtx.Clients.Route.Routes(route.Namespace).Delete(context.Background(), route.Name, meta.DeleteOptions{})
+		ctx.AddToCleanup(func() error {
+			t.Logf("Cleaning up OpenShift Route %s", route.GetName())
+			return ctx.Clients.Route.Routes(route.Namespace).Delete(context.Background(), route.Name, meta.DeleteOptions{})
+		})
+
+		// Do a spoofed HTTP request via the OpenShiftRouter
+		// Note, here we go via the OpenShift Router IP address, not kourier, as usual with the "spoof" client.
+		routerIP := lookupOpenShiftRouterIP(ctx)
+		sc, err := newSpoofClientWithTLS(ctx, customDomain, routerIP.String(), nil)
+		if err != nil {
+			t.Fatalf("Error creating a Spoofing Client: %v", err)
+		}
+
+		req, err := http.NewRequest(http.MethodGet, "http://"+customDomain, nil)
+		if err != nil {
+			t.Fatalf("Error creating an HTTP GET request: %v", err)
+		}
+
+		// Poll, as it is expected OpenShift Router will return 503s until it reconciles the Route.
+		resp, err := sc.Poll(req, pkgTest.IsStatusOK)
+		if err != nil {
+			t.Fatalf("Error polling custom domain: %v", err)
+		}
+
+		const expectedResponse = "Hello OpenShift!"
+		if resp.StatusCode != 200 || strings.TrimSpace(string(resp.Body)) != expectedResponse {
+			t.Fatalf("Expecting a HTTP 200 response with %q, got %d: %s", expectedResponse, resp.StatusCode, string(resp.Body))
+		}
 	})
-
-	// Do a spoofed HTTP request via the OpenShiftRouter
-	// Note, here we go via the OpenShift Router IP address, not kourier, as usual with the "spoof" client.
-	routerIP := lookupOpenShiftRouterIP(caCtx)
-	sc, err := newSpoofClientWithTLS(caCtx, customDomain, routerIP.String(), nil)
-	if err != nil {
-		t.Fatalf("Error creating a Spoofing Client: %v", err)
-	}
-
-	req, err := http.NewRequest(http.MethodGet, "http://"+customDomain, nil)
-	if err != nil {
-		t.Fatalf("Error creating an HTTP GET request: %v", err)
-	}
-
-	// Poll, as it is expected OpenShift Router will return 503s until it reconciles the Route.
-	resp, err := sc.Poll(req, pkgTest.IsStatusOK)
-	if err != nil {
-		t.Fatalf("Error polling custom domain: %v", err)
-	}
-
-	const expectedResponse = "Hello OpenShift!"
-	if resp.StatusCode != 200 || strings.TrimSpace(string(resp.Body)) != expectedResponse {
-		t.Fatalf("Expecting a HTTP 200 response with %q, got %d: %s", expectedResponse, resp.StatusCode, string(resp.Body))
-	}
 }
 
 // newSpoofClientWithTLS returns a Spoof client that always connects to the given IP address with 'customDomain' as SNI header
@@ -771,117 +912,113 @@ func newSpoofClientWithTLS(ctx *test.Context, customDomain, ip string, certPool 
 }
 
 func TestKsvcWithServiceMeshCustomTlsDomain(t *testing.T) {
-	caCtx := test.SetupClusterAdmin(t)
-	test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, caCtx) })
-	defer test.CleanupAll(t, caCtx)
+	runCustomDomainTlsTestForAllServiceMeshVersions(t, func(ctx *test.Context, certPool *x509.CertPool) {
+		t := ctx.T
 
-	const customSecretName = "custom.example.com"
-	certPool := setupCustomDomainTlsSecret(caCtx, serviceMeshTestNamespaceName, customSecretName, serviceMeshTestCustomDomain)
-	serviceMeshV1WithCustomDomainTlsTestSetup(caCtx, serviceMeshTestNamespaceName, testNamespace, customSecretName)
+		// Deploy a cluster-local ksvc "hello"
+		ksvc := test.Service("hello", testNamespace, "openshift/hello-openshift", nil)
+		ksvc.ObjectMeta.Labels = map[string]string{
+			network.VisibilityLabelKey: serving.VisibilityClusterLocal,
+		}
+		ksvc = withServiceReadyOrFail(ctx, ksvc)
 
-	// Deploy a cluster-local ksvc "hello"
-	ksvc := test.Service("hello", testNamespace, "openshift/hello-openshift", nil)
-	ksvc.ObjectMeta.Labels = map[string]string{
-		network.VisibilityLabelKey: serving.VisibilityClusterLocal,
-	}
-	ksvc = withServiceReadyOrFail(caCtx, ksvc)
+		// Create the Istio Gateway for traffic via istio-ingressgateway
+		// The secret and its mounts are specified in the example SMCP in hack/lib/mesh.bash
+		//
+		//       istio-ingressgateway:
+		//        secretVolumes:
+		//        - mountPath: /custom.example.com
+		//          name: custom-example-com
+		//          secretName: custom.example.com
+		//
+		defaultGateway := test.IstioGatewayWithTLS("default-gateway",
+			testNamespace,
+			serviceMeshTestCustomDomain,
+			"/custom.example.com/tls.key",
+			"/custom.example.com/tls.crt",
+		)
+		defaultGateway = test.CreateIstioGateway(ctx, defaultGateway)
 
-	// Create the Istio Gateway for traffic via istio-ingressgateway
-	// The secret and its mounts are specified in the example SMCP in hack/lib/mesh.bash
-	//
-	//       istio-ingressgateway:
-	//        secretVolumes:
-	//        - mountPath: /custom.example.com
-	//          name: custom-example-com
-	//          secretName: custom.example.com
-	//
-	defaultGateway := test.IstioGatewayWithTLS("default-gateway",
-		testNamespace,
-		serviceMeshTestCustomDomain,
-		"/custom.example.com/tls.key",
-		"/custom.example.com/tls.crt",
-	)
-	defaultGateway = test.CreateIstioGateway(caCtx, defaultGateway)
+		// Create the Istio VirtualService to rewrite the host header of a custom domain with the ksvc's svc hostname
+		virtualService := test.IstioVirtualServiceForKnativeServiceWithCustomDomain(ksvc, defaultGateway.GetName(), serviceMeshTestCustomDomain)
+		test.CreateIstioVirtualService(ctx, virtualService)
 
-	// Create the Istio VirtualService to rewrite the host header of a custom domain with the ksvc's svc hostname
-	virtualService := test.IstioVirtualServiceForKnativeServiceWithCustomDomain(ksvc, defaultGateway.GetName(), serviceMeshTestCustomDomain)
-	test.CreateIstioVirtualService(caCtx, virtualService)
+		// Create the Istio ServiceEntry for ksvc's svc hostname routing towards the knative kourier-internal gateway
+		serviceEntry := test.IstioServiceEntryForKnativeServiceTowardsKourier(ksvc)
+		test.CreateIstioServiceEntry(ctx, serviceEntry)
 
-	// Create the Istio ServiceEntry for ksvc's svc hostname routing towards the knative kourier-internal gateway
-	serviceEntry := test.IstioServiceEntryForKnativeServiceTowardsKourier(ksvc)
-	test.CreateIstioServiceEntry(caCtx, serviceEntry)
-
-	// Create the OpenShift Route for the custom domain pointing to the istio-ingressgateway
-	// Note, this one is created in the service mesh namespace ("istio-system"), not the test namespace
-	route := &routev1.Route{
-		ObjectMeta: meta.ObjectMeta{
-			Name:      "hello",
-			Namespace: serviceMeshTestNamespaceName,
-		},
-		Spec: routev1.RouteSpec{
-			Host: serviceMeshTestCustomDomain,
-			Port: &routev1.RoutePort{
-				TargetPort: intstr.FromInt(8443),
+		// Create the OpenShift Route for the custom domain pointing to the istio-ingressgateway
+		// Note, this one is created in the service mesh namespace ("istio-system"), not the test namespace
+		route := &routev1.Route{
+			ObjectMeta: meta.ObjectMeta{
+				Name:      "hello",
+				Namespace: serviceMeshTestNamespaceName,
 			},
-			TLS: &routev1.TLSConfig{
-				InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyNone,
-				Termination:                   routev1.TLSTerminationPassthrough,
+			Spec: routev1.RouteSpec{
+				Host: serviceMeshTestCustomDomain,
+				Port: &routev1.RoutePort{
+					TargetPort: intstr.FromInt(8443),
+				},
+				TLS: &routev1.TLSConfig{
+					InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyNone,
+					Termination:                   routev1.TLSTerminationPassthrough,
+				},
+				To: routev1.RouteTargetReference{
+					Kind: "Service",
+					Name: "istio-ingressgateway",
+				},
 			},
-			To: routev1.RouteTargetReference{
-				Kind: "Service",
-				Name: "istio-ingressgateway",
-			},
-		},
-	}
-	route, err := caCtx.Clients.Route.Routes(serviceMeshTestNamespaceName).Create(context.Background(), route, meta.CreateOptions{})
-	if err != nil {
-		t.Fatalf("Error creating OpenShift Route: %v", err)
-	}
+		}
+		route, err := ctx.Clients.Route.Routes(serviceMeshTestNamespaceName).Create(context.Background(), route, meta.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Error creating OpenShift Route: %v", err)
+		}
 
-	caCtx.AddToCleanup(func() error {
-		t.Logf("Cleaning up OpenShift Route %s", route.GetName())
-		return caCtx.Clients.Route.Routes(route.Namespace).Delete(context.Background(), route.Name, meta.DeleteOptions{})
+		ctx.AddToCleanup(func() error {
+			t.Logf("Cleaning up OpenShift Route %s", route.GetName())
+			return ctx.Clients.Route.Routes(route.Namespace).Delete(context.Background(), route.Name, meta.DeleteOptions{})
+		})
+
+		// Do a spoofed HTTP request.
+		// Note, here we go via the OpenShift Router IP address, not kourier as usual with the "spoof" client.
+		routerIP := lookupOpenShiftRouterIP(ctx)
+		sc, err := newSpoofClientWithTLS(ctx, serviceMeshTestCustomDomain, routerIP.String(), certPool)
+		if err != nil {
+			t.Fatalf("Error creating a Spoofing Client: %v", err)
+		}
+
+		req, err := http.NewRequest(http.MethodGet, "https://"+serviceMeshTestCustomDomain, nil)
+		if err != nil {
+			t.Fatalf("Error creating an HTTPS GET request: %v", err)
+		}
+
+		// Poll, as it is expected OpenShift Router will return 503s until it reconciles the Route.
+		resp, err := sc.Poll(req, pkgTest.IsStatusOK)
+		if err != nil {
+			t.Fatalf("Error polling custom domain: %v", err)
+		}
+
+		const expectedResponse = "Hello OpenShift!"
+		if resp.StatusCode != 200 || strings.TrimSpace(string(resp.Body)) != expectedResponse {
+			t.Fatalf("Expecting an HTTP 200 response with %q, got %d: %s", expectedResponse, resp.StatusCode, string(resp.Body))
+		}
+
+		// Verify we cannot connect via plain HTTP (as the Route has InsecureEdgeTerminationPolicyNone)
+		// In this case we expect a 503 response from the OpenShift Router.
+
+		// As the router already returned an OK response for the HTTPS request, we assume the route is already
+		// reconciled and its 503 response really means it won't serve insecure HTTP ever.
+		req, err = http.NewRequest(http.MethodGet, "http://"+serviceMeshTestCustomDomain, nil)
+		if err != nil {
+			t.Fatalf("Error creating an HTTP GET request: %v", err)
+		}
+		resp, err = sc.Do(req)
+		if err != nil {
+			t.Fatalf("Error doing HTTP request: %v", err)
+		}
+
+		if resp.StatusCode != 503 {
+			t.Fatalf("Expecting an HTTP 503 response for an insecure HTTP request, got %d: %s", resp.StatusCode, string(resp.Body))
+		}
 	})
-
-	// Do a spoofed HTTP request.
-	// Note, here we go via the OpenShift Router IP address, not kourier as usual with the "spoof" client.
-	routerIP := lookupOpenShiftRouterIP(caCtx)
-	sc, err := newSpoofClientWithTLS(caCtx, serviceMeshTestCustomDomain, routerIP.String(), certPool)
-	if err != nil {
-		t.Fatalf("Error creating a Spoofing Client: %v", err)
-	}
-
-	req, err := http.NewRequest(http.MethodGet, "https://"+serviceMeshTestCustomDomain, nil)
-	if err != nil {
-		t.Fatalf("Error creating an HTTPS GET request: %v", err)
-	}
-
-	// Poll, as it is expected OpenShift Router will return 503s until it reconciles the Route.
-	resp, err := sc.Poll(req, pkgTest.IsStatusOK)
-	if err != nil {
-		t.Fatalf("Error polling custom domain: %v", err)
-	}
-
-	const expectedResponse = "Hello OpenShift!"
-	if resp.StatusCode != 200 || strings.TrimSpace(string(resp.Body)) != expectedResponse {
-		t.Fatalf("Expecting an HTTP 200 response with %q, got %d: %s", expectedResponse, resp.StatusCode, string(resp.Body))
-	}
-
-	// Verify we cannot connect via plain HTTP (as the Route has InsecureEdgeTerminationPolicyNone)
-	// In this case we expect a 503 response from the OpenShift Router.
-
-	// As the router already returned an OK response for the HTTPS request, we assume the route is already
-	// reconciled and its 503 response really means it won't serve insecure HTTP ever.
-	req, err = http.NewRequest(http.MethodGet, "http://"+serviceMeshTestCustomDomain, nil)
-	if err != nil {
-		t.Fatalf("Error creating an HTTP GET request: %v", err)
-	}
-	resp, err = sc.Do(req)
-	if err != nil {
-		t.Fatalf("Error doing HTTP request: %v", err)
-	}
-
-	if resp.StatusCode != 503 {
-		t.Fatalf("Expecting an HTTP 503 response for an insecure HTTP request, got %d: %s", resp.StatusCode, string(resp.Body))
-	}
 }
