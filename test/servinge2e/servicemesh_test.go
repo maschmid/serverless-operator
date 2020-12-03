@@ -48,7 +48,7 @@ const (
 	helloworldImage              = "gcr.io/knative-samples/helloworld-go"
 	httpProxyImage               = "registry.svc.ci.openshift.org/openshift/knative-v0.17.3:knative-serving-test-httpproxy"
 	istioInjectKey               = "sidecar.istio.io/inject"
-  serviceMeshTestCustomDomain = "custom-ksvc-domain.example.com"
+	serviceMeshTestCustomDomain  = "custom-ksvc-domain.example.com"
 )
 
 func getServiceMeshNamespace(ctx *test.Context) string {
@@ -64,13 +64,13 @@ func isServiceMeshInstalled(ctx *test.Context) bool {
 	return getServiceMeshNamespace(ctx) != ""
 }
 
-func setupCustomDomainTlsSecret(ctx *test.Context, serviceMeshNamespace, customSecretName, customDomain string) *x509.CertPool{
+func setupCustomDomainTlsSecret(ctx *test.Context, serviceMeshNamespace, customSecretName, customDomain string) *x509.CertPool {
 	// Generate example.com CA
 	caCertificate := &x509.Certificate{
 		SerialNumber: big.NewInt(0),
 		Subject: pkix.Name{
-			Organization:  []string{"Example Inc."},
-			CommonName: "example.com",
+			Organization: []string{"Example Inc."},
+			CommonName:   "example.com",
 		},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().AddDate(1, 0, 0),
@@ -97,9 +97,9 @@ func setupCustomDomainTlsSecret(ctx *test.Context, serviceMeshNamespace, customS
 	customCertificate := &x509.Certificate{
 		SerialNumber: big.NewInt(0),
 		Subject: pkix.Name{
-			Organization:  []string{"Example Inc."},
+			Organization: []string{"Example Inc."},
 		},
-		DNSNames: []string { customDomain },
+		DNSNames:     []string{customDomain},
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().AddDate(1, 0, 0),
 		SubjectKeyId: []byte{42},
@@ -130,7 +130,7 @@ func setupCustomDomainTlsSecret(ctx *test.Context, serviceMeshNamespace, customS
 		},
 		Type: core.SecretTypeTLS,
 		Data: map[string][]byte{
-			core.TLSCertKey: customPem,
+			core.TLSCertKey:       customPem,
 			core.TLSPrivateKeyKey: customPrivateKeyPem,
 		},
 	}
@@ -495,7 +495,7 @@ func TestKsvcWithServiceMeshJWTDefaultPolicy(t *testing.T) {
 					"apiVersion": "authentication.istio.io/v1alpha1",
 					"kind":       "Policy",
 					"metadata": map[string]interface{}{
-						"name": "default",
+						"name":      "default",
 						"namespace": testNamespace,
 					},
 					"spec": map[string]interface{}{
@@ -538,13 +538,13 @@ func TestKsvcWithServiceMeshJWTDefaultPolicy(t *testing.T) {
 					"apiVersion": "security.istio.io/v1beta1",
 					"kind":       "RequestAuthentication",
 					"metadata": map[string]interface{}{
-						"name": "jwt-example",
+						"name":      "jwt-example",
 						"namespace": testNamespace,
 					},
 					"spec": map[string]interface{}{
 						"jwtRules": []map[string]interface{}{
 							{
-								"issuer": issuer,
+								"issuer":  issuer,
 								"jwksUri": jwksKsvc.Status.URL,
 							},
 						},
@@ -565,14 +565,14 @@ func TestKsvcWithServiceMeshJWTDefaultPolicy(t *testing.T) {
 					"apiVersion": "security.istio.io/v1beta1",
 					"kind":       "AuthorizationPolicy",
 					"metadata": map[string]interface{}{
-						"name": "allowlist-by-paths",
+						"name":      "allowlist-by-paths",
 						"namespace": testNamespace,
 					},
 					"spec": map[string]interface{}{
 						"action": "ALLOW",
 						"rules": []map[string]interface{}{
 							{
-								"to":  []map[string]interface{}{
+								"to": []map[string]interface{}{
 									{
 										"operation": map[string]interface{}{
 											"paths": []string{
@@ -601,14 +601,14 @@ func TestKsvcWithServiceMeshJWTDefaultPolicy(t *testing.T) {
 					"apiVersion": "security.istio.io/v1beta1",
 					"kind":       "AuthorizationPolicy",
 					"metadata": map[string]interface{}{
-						"name": "require-jwt",
+						"name":      "require-jwt",
 						"namespace": testNamespace,
 					},
 					"spec": map[string]interface{}{
 						"action": "ALLOW",
 						"rules": []map[string]interface{}{
 							{
-								"from":  []map[string]interface{}{
+								"from": []map[string]interface{}{
 									{
 										"source": map[string]interface{}{
 											"requestPrincipals": []string{
@@ -791,7 +791,6 @@ func lookupOpenShiftRouterIP(ctx *test.Context) net.IP {
 	ctx.T.Logf("Resolved the following IPs %v as the OpenShift Router address and use %v for test", ips, ips[0])
 	return ips[0]
 }
-
 
 func TestKsvcWithServiceMeshCustomDomain(t *testing.T) {
 	const customDomain = "custom-ksvc-domain.example.com"

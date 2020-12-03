@@ -63,8 +63,8 @@ func AddServiceMeshControlPlaneV1IngressGatewaySecretVolume(smcp *unstructured.U
 func AddServiceMeshControlPlaneV2IngressGatewaySecretVolume(smcp *unstructured.Unstructured, name, secretName, mountPath string) error {
 	secretVolume := make(map[string]interface{})
 	unstructured.SetNestedField(secretVolume, secretName, "volume", "secret", "secretName")
-	unstructured.SetNestedField(secretVolume, name,  "volumeMount", "name")
-	unstructured.SetNestedField(secretVolume, mountPath,  "volumeMount", "mountPath")
+	unstructured.SetNestedField(secretVolume, name, "volumeMount", "name")
+	unstructured.SetNestedField(secretVolume, mountPath, "volumeMount", "mountPath")
 
 	volumes, found, _ := unstructured.NestedSlice(smcp.Object, "spec", "gateways", "ingress", "volumes")
 	if found {
@@ -346,10 +346,10 @@ func AllowFromServingSystemNamespaceNetworkPolicy(namespace string) *networking.
 			Name:      "allow-from-serving-system-namespace",
 			Namespace: namespace,
 		},
-		Spec: networking.NetworkPolicySpec {
-			Ingress: []networking.NetworkPolicyIngressRule {
+		Spec: networking.NetworkPolicySpec{
+			Ingress: []networking.NetworkPolicyIngressRule{
 				{
-					From: []networking.NetworkPolicyPeer {
+					From: []networking.NetworkPolicyPeer{
 						{
 							NamespaceSelector: &meta.LabelSelector{
 								MatchLabels: map[string]string{
