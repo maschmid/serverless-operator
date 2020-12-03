@@ -13,14 +13,15 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"knative.dev/serving/pkg/apis/autoscaling"
 	"math/big"
 	"net"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/api/errors"
+	"knative.dev/serving/pkg/apis/autoscaling"
 
 	"github.com/openshift-knative/serverless-operator/test"
 	routev1 "github.com/openshift/api/route/v1"
