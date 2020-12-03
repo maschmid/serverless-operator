@@ -70,7 +70,7 @@ func isServiceMeshInstalled(ctx *test.Context) bool {
 	return false
 }
 
-func setupCustomDomainTlsSecret(ctx *test.Context, serviceMeshNamespace, customSecretName, customDomain string) *x509.CertPool {
+func setupCustomDomainTLSSecret(ctx *test.Context, serviceMeshNamespace, customSecretName, customDomain string) *x509.CertPool {
 	// Generate example.com CA
 	caCertificate := &x509.Certificate{
 		SerialNumber: big.NewInt(0),
@@ -166,7 +166,7 @@ func setupNamespaceForServiceMesh(ctx *test.Context, serviceMeshNamespace, testN
 	test.LabelNamespace(ctx, "knative-serving-ingress", "knative.openshift.io/system-namespace", "true")
 }
 
-func runCustomDomainTlsTestForAllServiceMeshVersions(t *testing.T, customSecretName, secretVolumeName, secretVolumeMountPath string, testFunc func(ctx *test.Context)) {
+func runCustomDomainTLSTestForAllServiceMeshVersions(t *testing.T, customSecretName, secretVolumeName, secretVolumeMountPath string, testFunc func(ctx *test.Context)) {
 	const smcpName = "basic"
 
 	type serviceMeshVersion struct {
@@ -222,7 +222,7 @@ func runCustomDomainTlsTestForAllServiceMeshVersions(t *testing.T, customSecretN
 }
 
 func runTestForAllServiceMeshVersions(t *testing.T, testFunc func(ctx *test.Context)) {
-	runCustomDomainTlsTestForAllServiceMeshVersions(t, "", "", "", testFunc)
+	runCustomDomainTLSTestForAllServiceMeshVersions(t, "", "", "", testFunc)
 }
 
 // A knative service acting as an "http proxy", redirects requests towards a given "host". Used to test cluster-local services
@@ -895,9 +895,9 @@ func TestKsvcWithServiceMeshCustomTlsDomain(t *testing.T) {
 	test.CleanupOnInterrupt(t, func() { test.CleanupAll(t, ctx) })
 	defer test.CleanupAll(t, ctx)
 
-	certPool := setupCustomDomainTlsSecret(ctx, serviceMeshTestNamespaceName, customSecretName, customDomain)
+	certPool := setupCustomDomainTLSSecret(ctx, serviceMeshTestNamespaceName, customSecretName, customDomain)
 
-	runCustomDomainTlsTestForAllServiceMeshVersions(t, customSecretName, secretVolumeName, secretVolumeMountPath, func(ctx *test.Context) {
+	runCustomDomainTLSTestForAllServiceMeshVersions(t, customSecretName, secretVolumeName, secretVolumeMountPath, func(ctx *test.Context) {
 		t := ctx.T
 
 		// Deploy a cluster-local ksvc "hello"
