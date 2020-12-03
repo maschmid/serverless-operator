@@ -316,6 +316,7 @@ func TestKsvcWithServiceMeshSidecar(t *testing.T) {
 			expectIstioSidecar: true,
 		}}
 
+		t := ctx.T
 		for _, scenario := range tests {
 			scenario := scenario
 			t.Run(scenario.name, func(t *testing.T) {
