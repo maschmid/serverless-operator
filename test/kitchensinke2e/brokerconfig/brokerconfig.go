@@ -17,6 +17,7 @@ var yaml embed.FS
 const defaultKafkaBrokerBootstrap = "my-cluster-kafka-bootstrap.kafka:9092"
 const defaultKafkaPartitions = 10
 const defaultKafkaReplicationFactor = 3
+const defaultKafkaRetentionDuration = "PT168H"
 
 func GVR() schema.GroupVersionResource {
 	return schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
@@ -43,6 +44,7 @@ func WithKafkaChannelMTBroker(kafkaChannelOpts ...manifest.CfgFn) manifest.CfgFn
 			"version":           kafkachannel.GVR().Version,
 			"numPartitions":     defaultKafkaPartitions,
 			"replicationFactor": defaultKafkaReplicationFactor,
+			"retentionDuration": defaultKafkaRetentionDuration,
 		}
 
 		for _, fn := range kafkaChannelOpts {

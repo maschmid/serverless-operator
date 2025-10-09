@@ -16,6 +16,7 @@ data:
     spec:
       numPartitions: {{ .kafkaChannel.numPartitions }}
       replicationFactor: {{ .kafkaChannel.replicationFactor }}
+      retentionDuration: {{ .kafkaChannel.retentionDuration }}
   {{ end }}
   {{ if .inMemoryChannel }}
   channel-template-spec: |

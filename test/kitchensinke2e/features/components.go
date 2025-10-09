@@ -2,17 +2,21 @@ package features
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
+	"knative.dev/reconciler-test/pkg/environment"
 	"knative.dev/reconciler-test/pkg/resources/service"
+	"sigs.k8s.io/yaml"
 
 	"github.com/openshift-knative/serverless-operator/test/kitchensinke2e/brokerconfig"
 	"github.com/openshift-knative/serverless-operator/test/kitchensinke2e/inmemorychannel"
+	"github.com/openshift-knative/serverless-operator/test/kitchensinke2e/kafkachannel"
 	ksvcresources "github.com/openshift-knative/serverless-operator/test/kitchensinke2e/ksvc"
 	rbacv1 "k8s.io/api/rbac/v1"
 	testpkg "knative.dev/eventing-kafka-broker/test/pkg"
-	kafkachannelresources "knative.dev/eventing-kafka-broker/test/rekt/resources/kafkachannel"
 	"knative.dev/eventing-kafka-broker/test/rekt/resources/kafkasink"
 	"knative.dev/eventing-kafka-broker/test/rekt/resources/kafkasource"
 	"knative.dev/eventing-kafka-broker/test/rekt/resources/kafkatopic"
@@ -45,11 +49,12 @@ so we don't implement any kind of dataplane in the components.
 func withKafkaChannelTemplate() manifest.CfgFn {
 	return func(cfg map[string]interface{}) {
 		cfg["channelTemplate"] = map[string]interface{}{
-			"apiVersion": kafkachannelresources.GVR().GroupVersion().String(),
+			"apiVersion": kafkachannel.GVR().GroupVersion().String(),
 			"kind":       "KafkaChannel",
 			"spec": map[string]string{
 				"replicationFactor": "3",
 				"numPartitions":     "10",
+				"retentionDuration": "PT128H",
 			},
 		}
 	}
@@ -68,19 +73,8 @@ var kafkaChannel = genericComponent{
 	shortLabel: "kc",
 	label:      "KafkaChannel",
 	kind:       "KafkaChannel",
-	gvr:        kafkachannelresources.GVR(),
-	install: func(name string, opts ...manifest.CfgFn) feature.StepFn {
-		defaultOpts := []manifest.CfgFn{
-			kafkachannelresources.WithNumPartitions("10"),
-			kafkachannelresources.WithReplicationFactor("3"),
-		}
-
-		opts = append(defaultOpts, opts...)
-
-		return kafkachannelresources.Install(name,
-			opts...,
-		)
-	},
+	gvr:        kafkachannel.GVR(),
+	install:    kafkachannel.Install,
 }
 
 var inMemoryChannel = genericComponent{
@@ -322,8 +316,47 @@ var eventTransformGeneric = genericComponent{
 	gvr:        eventtransform.GVR(),
 	install: func(name string, opts ...manifest.CfgFn) feature.StepFn {
 		return func(ctx context.Context, t feature.T) {
+			// TODO: workaround for https://issues.redhat.com/browse/SRVKE-1805
+			// hack the .spec.sink.ref to include the test namespace
+			namespace := environment.FromContext(ctx).Namespace()
+			if namespace == "" {
+				panic("namespace is empty!")
+			}
+			opts2 := append(opts, func(m map[string]interface{}) {
+				spec := m["spec"]
+				var data map[string]interface{}
+				err := yaml.Unmarshal([]byte(spec.(string)), &data)
+				if err != nil {
+					panic(err)
+				}
+				if data["sink"] == nil || data["sink"].(map[string]interface{})["ref"] == nil {
+					// no sink ref, no need to change anything
+					return
+				}
+				data["sink"].(map[string]interface{})["ref"].(map[string]interface{})["namespace"] = namespace
+
+				specBytes, err := json.Marshal(data)
+				if err != nil {
+					panic(err)
+				}
+
+				yamlBytes, err := yaml.JSONToYAML(specBytes)
+				if err != nil {
+					panic(err)
+				}
+
+				specYaml := string(yamlBytes)
+
+				lines := strings.Split(specYaml, "\n")
+				out := make([]string, 0, len(lines))
+				for i := range lines {
+					out = append(out, "  "+lines[i])
+				}
+
+				m["spec"] = strings.Join(out, "\n")
+			})
 			eventtransform.Install(name,
-				opts...)(ctx, t)
+				opts2...)(ctx, t)
 		}
 	},
 }
