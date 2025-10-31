@@ -131,9 +131,9 @@ func reinstallResources() feature.StepFn {
 func TestUninstalledFeatureSet(ctx context.Context, env environment.Environment, t *testing.T, fss ...feature.FeatureSet) {
 	t.Run("uninstall Serverless", func(t *testing.T) {
 		uninstallAll := feature.NewFeatureNamed("Uninstall Serverless")
-		// TODO: workaround for https://issues.redhat.com/browse/SRVKS-1325 , skip Serving reinstall for now
-		//uninstallAll.Setup("Uninstall Serving", uninstallKnativeServingStep())
-		//uninstallAll.Assert("Wait for Serving controllers non-existence", waitForPodNonExistence("knative-serving", "app.kubernetes.io/component=controller", "app.kubernetes.io/component=webhook"))
+
+		uninstallAll.Setup("Uninstall Serving", uninstallKnativeServingStep())
+		uninstallAll.Assert("Wait for Serving controllers non-existence", waitForPodNonExistence("knative-serving", "app.kubernetes.io/component=controller", "app.kubernetes.io/component=webhook"))
 
 		uninstallAll.Setup("Uninstall Eventing and KnativeKafka", func(ctx context.Context, t feature.T) {
 			// need to be sync, to be sure we install KnativeEventing first when re-installing
