@@ -98,6 +98,7 @@ func (e *extension) Transformers(ks base.KComponent) []mf.Transformer {
 		addKourierAppProtocol(ks),
 		common.VersionedJobNameTransform(),
 		common.InjectCommonEnvironment(),
+		common.RemoveRulesFromAggregatedClusterRoles(),
 	}
 	tf = append(tf, enableSecretInformerFilteringTransformers(ks)...)
 	tf = append(tf, monitoring.GetServingTransformers(ks)...)

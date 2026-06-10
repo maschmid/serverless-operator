@@ -364,6 +364,7 @@ func (r *ReconcileKnativeKafka) transform(manifest *mf.Manifest, instance *serve
 		operatorcommon.OverridesTransform(instance.Spec.Workloads, logging.FromContext(context.TODO())),
 		socommon.ConfigMapVolumeChecksumTransform(context.Background(), r.client, dependentConfigMaps),
 		socommon.JobsRemoveTTLSecondsAfterFinished(),
+		socommon.RemoveRulesFromAggregatedClusterRoles(),
 		injectNamespacedBrokerMonitoring(r.client)), socommon.DeprecatedAPIsTranformersFromConfig()...)
 	tfs = append(tfs, rbacProxyTranforms...)
 
